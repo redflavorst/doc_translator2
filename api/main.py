@@ -9,21 +9,29 @@ import tempfile
 import asyncio
 import logging
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response, Cookie, Depends
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import uuid
 
 from core.workflow_manager import WorkflowManager
 from core.error_handler import WorkflowErrorHandler
 from core.config import app_config
 from core.models import WorkflowStatus, WorkflowStage
+
+# 새로 추가된 인증 관련 import
+from core.database import DatabaseManager
+from core.auth_manager import AuthManager
+from core.user_upload_manager import UserUploadManager
+
 # 기존 서비스 파일들 import
 from services.layout_analysis_service import LayoutAnalysisService, LayoutAnalysisResult
 # 페이지별 레이아웃 분석 서비스 (테스트용)
 from services.layout_analysis_service_paged import LayoutAnalysisServicePaged
 from services.translation_service import TranslationService, BatchTranslationResult
+from core.user_history_manager import UserHistoryManager
 
 # 로거 설정
 logger = logging.getLogger(__name__)
@@ -38,6 +46,12 @@ app = FastAPI(
 # 전역 서비스 인스턴스
 workflow_manager = WorkflowManager(app_config.workflow)
 error_handler = WorkflowErrorHandler(workflow_manager, app_config.workflow)
+history_manager = UserHistoryManager()
+
+# 새로 추가: 인증 관련 전역 인스턴스
+db_manager = DatabaseManager()
+auth_manager = AuthManager(db_manager)
+upload_manager = UserUploadManager(db_manager)
 
 # 기존 서비스 인스턴스 생성 (페이지별 처리 방식으로 변경)
 # layout_service = LayoutAnalysisService({  # 기존 방식
@@ -97,8 +111,25 @@ class WorkflowListResponse(BaseModel):
     failed: int
     paused: int
 
+# 인증 관련 의존성 함수들
+def get_current_user(session_token: str = Cookie(None)):
+    """현재 로그인한 사용자 정보 반환"""
+    if not session_token:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+    
+    user = auth_manager.get_user_by_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="유효하지 않은 세션입니다")
+    
+    return user
 
-# 문서 처리 클래스
+def get_optional_user(session_token: str = Cookie(None)):
+    """로그인한 사용자가 있으면 반환, 없으면 None"""
+    if not session_token:
+        return None
+    return auth_manager.get_user_by_session(session_token)
+
+# 문서 처리 클래스 (기존과 동일하지만 사용자 정보 추가)
 class DocumentProcessor:
     """문서 처리 오케스트레이터"""
     
@@ -338,16 +369,114 @@ document_processor = DocumentProcessor(
     workflow_manager, error_handler, layout_service, translation_service
 )
 
+# ========== 인증 API 엔드포인트들 ==========
 
-# API 엔드포인트들
+# 회원가입
+@app.post("/api/v1/auth/register")
+async def register_user(request: dict):
+    """사용자 회원가입"""
+    username = request.get('username')
+    email = request.get('email')
+    password = request.get('password')
+    
+    if not all([username, email, password]):
+        raise HTTPException(status_code=400, detail="모든 필드를 입력해주세요")
+    
+    success, message = auth_manager.register_user(username, email, password)
+    
+    if success:
+        logger.info(f"New user registered: {username}")
+        return {"success": True, "message": message}
+    else:
+        raise HTTPException(status_code=400, detail=message)
+
+# 로그인
+@app.post("/api/v1/auth/login")
+async def login_user(request: dict, response: Response):
+    """사용자 로그인"""
+    username = request.get('username')
+    password = request.get('password')
+    
+    if not all([username, password]):
+        raise HTTPException(status_code=400, detail="사용자명과 비밀번호를 입력해주세요")
+    
+    success, message, session_token = auth_manager.login_user(username, password)
+    
+    if success and session_token:
+        # 세션 쿠키 설정
+        response.set_cookie(
+            key="session_token",
+            value=session_token,
+            max_age=86400 * 7,  # 7일
+            httponly=True,
+            secure=False,  # HTTPS에서는 True로 설정
+            samesite="lax"
+        )
+        
+        # 사용자 정보 조회
+        user = auth_manager.get_user_by_session(session_token)
+        user_info = {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "created_at": user.created_at,
+            "last_login": user.last_login
+        } if user else None
+        
+        logger.info(f"User logged in: {username}")
+        return {"success": True, "message": message, "user": user_info}
+    else:
+        raise HTTPException(status_code=401, detail=message)
+
+# 로그아웃
+@app.post("/api/v1/auth/logout")
+async def logout_user(response: Response, session_token: str = Cookie(None)):
+    """사용자 로그아웃"""
+    if session_token:
+        auth_manager.logout_user(session_token)
+    
+    # 쿠키 삭제
+    response.delete_cookie(key="session_token")
+    
+    return {"success": True, "message": "로그아웃되었습니다"}
+
+# 인증 상태 확인
+@app.get("/api/v1/auth/check")
+async def check_auth_status(user = Depends(get_optional_user)):
+    """인증 상태 확인"""
+    if user:
+        return {
+            "authenticated": True,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email
+            }
+        }
+    else:
+        return {"authenticated": False, "user": None}
+
+# 내 정보 조회
+@app.get("/api/v1/auth/me")
+async def get_current_user_info(current_user = Depends(get_current_user)):
+    """현재 사용자 정보 조회"""
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "created_at": current_user.created_at,
+        "last_login": current_user.last_login
+    }
+
+ # API 엔드포인트들
+ # ========== 업로드 API 엔드포인트들 (인증 필요) ==========
 @app.post("/api/v1/documents/upload", response_model=UploadResponse)
 async def upload_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user = Depends(get_current_user)
 ):
-    """
-    PDF 문서 업로드 및 번역 시작
-    """
+    """문서 업로드 및 번역 시작 (로그인 필요)"""
+    
     # 파일 유효성 검증
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -357,7 +486,7 @@ async def upload_document(
     
     # 파일 저장
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_filename = f"{timestamp}_{file.filename}"
+    safe_filename = f"{timestamp}_{current_user.username}_{file.filename}"
     file_path = UPLOAD_DIR / safe_filename
     
     try:
@@ -366,16 +495,31 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
-    # 출력 디렉토리 생성
-    output_dir = OUTPUT_DIR / f"output_{timestamp}"
+    # 사용자별 출력 디렉토리 생성
+    output_dir = OUTPUT_DIR / f"user_{current_user.id}_{timestamp}"
     output_dir.mkdir(exist_ok=True)
     
-    # 문서 처리 시작
     try:
+        # 문서 처리 시작
         result = await document_processor.process_document(str(file_path), str(output_dir))
+        
+        # DB에 업로드 기록 추가
+        try:
+            file_size = file_path.stat().st_size if file_path.exists() else 0
+            upload_manager.add_upload_record(
+                user_id=current_user.id,
+                workflow_id=result["workflow_id"],
+                original_filename=file.filename,
+                file_size=file_size,
+                output_directory=str(output_dir)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to add upload record: {e}")
+        
         return UploadResponse(**result)
+        
     except Exception as e:
-        # 업로드된 파일 정리
+        # 에러 시 파일 정리
         if file_path.exists():
             file_path.unlink()
         raise e
@@ -412,6 +556,94 @@ async def list_workflows():
     """
     stats = workflow_manager.get_workflow_statistics()
     return WorkflowListResponse(**stats)
+
+
+@app.get("/api/v1/my-uploads")
+async def get_my_uploads(
+    limit: int = 20,
+    current_user = Depends(get_current_user)
+):
+    """내 업로드 기록 조회 (DB 기반)"""
+    
+    uploads = upload_manager.get_user_uploads(current_user.id, limit)
+    
+    for upload in uploads:
+        try:
+            state = workflow_manager.get_workflow(upload['workflow_id'])
+            if (upload['status'] != state.status.value or 
+                upload['progress'] != state.progress_percentage):
+                
+                processing_time = None
+                if state.status.value == "COMPLETED":
+                    time_diff = state.updated_at - state.created_at
+                    processing_time = time_diff.total_seconds()
+                
+                upload_manager.update_upload_status(
+                    workflow_id=upload['workflow_id'],
+                    status=state.status.value,
+                    progress=state.progress_percentage,
+                    processing_time=processing_time,
+                    error_message=state.error_info.get('message') if state.error_info else None
+                )
+                
+                upload['status'] = state.status.value
+                upload['progress'] = state.progress_percentage
+                upload['processing_time'] = processing_time
+                if state.error_info:
+                    upload['error_message'] = state.error_info.get('message')
+        except FileNotFoundError:
+            upload['status'] = "DELETED"
+            upload['error_message'] = "워크플로우가 삭제되었습니다"
+    
+    stats = upload_manager.get_user_statistics(current_user.id)
+    
+    return {
+        "uploads": uploads,
+        "statistics": stats,
+        "total": len(uploads),
+        "user": {
+            "id": current_user.id,
+            "username": current_user.username
+        }
+    }
+
+
+@app.delete("/api/v1/uploads/{workflow_id}")
+async def delete_upload_record(
+    workflow_id: str,
+    current_user = Depends(get_current_user)
+):
+    """업로드 기록 삭제 (로그인 필요)"""
+    upload = upload_manager.get_upload_by_workflow(workflow_id)
+    if not upload or upload['user_id'] != current_user.id:
+        raise HTTPException(status_code=404, detail="Upload not found or access denied")
+    
+    try:
+        workflow_manager.delete_workflow(workflow_id)
+    except FileNotFoundError:
+        pass
+    
+    success = upload_manager.delete_upload_record(current_user.id, workflow_id)
+    if success:
+        return {"message": "Upload record deleted successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Upload record not found")
+
+
+@app.get("/api/v1/uploads/{workflow_id}/download")
+async def download_upload_result(
+    workflow_id: str,
+    current_user = Depends(get_current_user)
+):
+    """업로드 결과 다운로드 (로그인 및 소유권 확인)"""
+    upload = upload_manager.get_upload_by_workflow(workflow_id)
+    if not upload or upload['user_id'] != current_user.id:
+        raise HTTPException(status_code=404, detail="Upload not found or access denied")
+    
+    if upload['status'] != "COMPLETED":
+        raise HTTPException(status_code=400, detail="Upload not completed yet")
+    
+    return await download_result(workflow_id)
 
 
 @app.get("/api/v1/workflows/{workflow_id}/download")
@@ -490,52 +722,321 @@ def get_web_interface_html() -> str:
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Doc test</title>
+        <title>📄 문서 번역 서비스</title>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-            .upload-area { border: 2px dashed #ccc; padding: 40px; text-align: center; margin: 20px 0; }
-            .upload-area:hover { border-color: #999; }
-            .progress { width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden; }
-            .progress-bar { height: 100%; background: #4CAF50; transition: width 0.3s; }
-            .workflow-item { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 5px; }
-            .status-running { border-left: 4px solid #2196F3; }
-            .status-completed { border-left: 4px solid #4CAF50; }
-            .status-failed { border-left: 4px solid #f44336; }
-            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #45a049; }
-            .error { color: #f44336; }
+            body { 
+                font-family: 'Segoe UI', Arial, sans-serif; 
+                max-width: 1200px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background-color: #f8f9fa;
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 30px;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border-radius: 15px;
+            }
+            .upload-area { 
+                border: 2px dashed #ccc; 
+                padding: 40px; 
+                text-align: center; 
+                margin: 20px 0;
+                border-radius: 10px;
+                background: white;
+                transition: all 0.3s;
+            }
+            .upload-area:hover { 
+                border-color: #667eea; 
+                background-color: #f8f9ff;
+            }
+            .upload-area.dragover {
+                border-color: #667eea;
+                background-color: #e8f0fe;
+            }
+            .progress { 
+                width: 100%; 
+                height: 25px; 
+                background: #f0f0f0; 
+                border-radius: 12px; 
+                overflow: hidden;
+                margin: 10px 0;
+            }
+            .progress-bar { 
+                height: 100%; 
+                background: linear-gradient(90deg, #4CAF50, #45a049); 
+                transition: width 0.3s; 
+                border-radius: 12px;
+            }
+            .tabs {
+                display: flex;
+                margin: 20px 0;
+                border-bottom: 2px solid #e9ecef;
+            }
+            .tab {
+                padding: 15px 25px;
+                cursor: pointer;
+                border-bottom: 3px solid transparent;
+                font-weight: 500;
+                transition: all 0.3s;
+            }
+            .tab.active {
+                border-bottom-color: #667eea;
+                color: #667eea;
+                background-color: #f8f9ff;
+            }
+            .tab:hover {
+                background-color: #f1f3f4;
+            }
+            .tab-content {
+                display: none;
+                padding: 20px;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .tab-content.active {
+                display: block;
+            }
+            .upload-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 15px;
+                margin: 10px 0;
+                border: 1px solid #e9ecef;
+                border-radius: 8px;
+                background: white;
+                transition: all 0.3s;
+            }
+            .upload-item:hover {
+                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                transform: translateY(-2px);
+            }
+            .upload-info {
+                flex: 1;
+            }
+            .upload-filename {
+                font-weight: bold;
+                color: #333;
+                margin-bottom: 5px;
+            }
+            .upload-meta {
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 8px;
+            }
+            .upload-status {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 15px;
+                font-size: 11px;
+                font-weight: bold;
+                text-transform: uppercase;
+            }
+            .status-completed { background: #d4edda; color: #155724; }
+            .status-running { background: #d1ecf1; color: #0c5460; }
+            .status-failed { background: #f8d7da; color: #721c24; }
+            .status-created { background: #fff3cd; color: #856404; }
+            .upload-actions {
+                display: flex;
+                gap: 8px;
+            }
+            .btn {
+                padding: 8px 16px;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 12px;
+                transition: all 0.3s;
+                text-decoration: none;
+                display: inline-block;
+            }
+            .btn-primary { background: #667eea; color: white; }
+            .btn-primary:hover { background: #5a6fd8; }
+            .btn-success { background: #4CAF50; color: white; }
+            .btn-success:hover { background: #45a049; }
+            .btn-danger { background: #dc3545; color: white; }
+            .btn-danger:hover { background: #c82333; }
+            .btn-secondary { background: #6c757d; color: white; }
+            .btn-secondary:hover { background: #5a6268; }
+            .statistics {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+            .stat-card {
+                background: white;
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            }
+            .stat-number {
+                font-size: 2em;
+                font-weight: bold;
+                color: #667eea;
+            }
+            .stat-label {
+                color: #666;
+                font-size: 0.9em;
+            }
+            .empty-state {
+                text-align: center;
+                padding: 40px;
+                color: #666;
+            }
+            .empty-state img {
+                width: 100px;
+                opacity: 0.5;
+                margin-bottom: 20px;
+            }
+            .upload-progress {
+                width: 100%;
+                height: 8px;
+                background: #f0f0f0;
+                border-radius: 4px;
+                margin-top: 5px;
+            }
+            .upload-progress-bar {
+                height: 100%;
+                background: linear-gradient(90deg, #667eea, #764ba2);
+                border-radius: 4px;
+                transition: width 0.3s;
+            }
+            .error { color: #dc3545; }
             .success { color: #4CAF50; }
+            .info { color: #17a2b8; }
         </style>
     </head>
     <body>
-        <h1>📄 doc 서비스</h1>
-        <p>PDF 파일을 업로드하면 한국어로 번역해드립니다.</p>
-        
-        <div class="upload-area" onclick="document.getElementById('file-input').click()">
-            <input type="file" id="file-input" accept=".pdf" style="display: none;" onchange="uploadFile()">
-            <p>📁 클릭하여 PDF 파일을 선택하거나 여기에 끌어다 놓으세요</p>
+        <div class="header">
+            <h1>📄 문서 번역 서비스</h1>
+            <p>PDF 파일을 업로드하면 한국어로 번역해드립니다</p>
         </div>
         
-        <div id="upload-status"></div>
+        <!-- 탭 네비게이션 -->
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('upload')">🔄 새 번역</div>
+            <div class="tab" onclick="switchTab('history')">📋 내 기록</div>
+            <div class="tab" onclick="switchTab('status')">📊 현재 작업</div>
+        </div>
         
-        <h2>📊 워크플로우 목록</h2>
-        <button onclick="refreshWorkflows()">🔄 새로고침</button>
-        <div id="workflows-list"></div>
+        <!-- 새 번역 탭 -->
+        <div id="upload-tab" class="tab-content active">
+            <div class="upload-area" onclick="document.getElementById('file-input').click()" 
+                ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+                <input type="file" id="file-input" accept=".pdf" style="display: none;" onchange="uploadFile()">
+                <p>📁 클릭하여 PDF 파일을 선택하거나 여기에 끌어다 놓으세요</p>
+                <p style="color: #666; font-size: 0.9em;">지원 형식: PDF | 최대 크기: 100MB</p>
+            </div>
+            
+            <div id="upload-status"></div>
+        </div>
+        
+        <!-- 내 기록 탭 -->
+        <div id="history-tab" class="tab-content">
+            <div class="statistics" id="statistics">
+                <!-- 통계 카드들이 여기에 동적으로 추가됩니다 -->
+            </div>
+            
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3>📋 업로드 기록</h3>
+                <button class="btn btn-secondary" onclick="refreshHistory()">🔄 새로고침</button>
+            </div>
+            
+            <div id="history-list">
+                <div class="empty-state">
+                    <p>아직 업로드 기록이 없습니다.</p>
+                    <p>첫 번째 PDF 파일을 업로드해보세요!</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 현재 작업 탭 -->
+        <div id="status-tab" class="tab-content">
+            <h3>📊 실행 중인 작업</h3>
+            <div id="current-workflows"></div>
+        </div>
         
         <script>
+            let currentTab = 'upload';
             let currentWorkflowId = null;
             
+            // 탭 전환
+            function switchTab(tabName) {
+                // 모든 탭 비활성화
+                document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                
+                // 선택한 탭 활성화
+                document.querySelector(`[onclick="switchTab('${tabName}')"]`).classList.add('active');
+                document.getElementById(`${tabName}-tab`).classList.add('active');
+                
+                currentTab = tabName;
+                
+                // 탭별 데이터 로드
+                if (tabName === 'history') {
+                    refreshHistory();
+                } else if (tabName === 'status') {
+                    refreshCurrentWorkflows();
+                }
+            }
+            
+            // 드래그 앤 드롭 처리
+            function handleDragOver(e) {
+                e.preventDefault();
+                e.currentTarget.classList.add('dragover');
+            }
+            
+            function handleDragLeave(e) {
+                e.preventDefault();
+                e.currentTarget.classList.remove('dragover');
+            }
+            
+            function handleDrop(e) {
+                e.preventDefault();
+                e.currentTarget.classList.remove('dragover');
+                
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    const fileInput = document.getElementById('file-input');
+                    fileInput.files = files;
+                    uploadFile();
+                }
+            }
+            
+            // 파일 업로드
             async function uploadFile() {
                 const fileInput = document.getElementById('file-input');
                 const file = fileInput.files[0];
                 
                 if (!file) return;
                 
+                if (!file.name.toLowerCase().endsWith('.pdf')) {
+                    alert('PDF 파일만 업로드 가능합니다.');
+                    return;
+                }
+                
                 const formData = new FormData();
                 formData.append('file', file);
                 
-                document.getElementById('upload-status').innerHTML = '<p>⏳ 파일 업로드 중...</p>';
+                document.getElementById('upload-status').innerHTML = `
+                    <div class="upload-item">
+                        <div class="upload-info">
+                            <div class="upload-filename">${file.name}</div>
+                            <div class="upload-meta">크기: ${formatFileSize(file.size)} | 업로드 중...</div>
+                            <div class="progress">
+                                <div class="progress-bar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                `;
                 
                 try {
                     const response = await fetch('/api/v1/documents/upload', {
@@ -547,22 +1048,35 @@ def get_web_interface_html() -> str:
                     
                     if (response.ok) {
                         currentWorkflowId = result.workflow_id;
-                        document.getElementById('upload-status').innerHTML = 
-                            `<p class="success">✅ 업로드 성공! 번역을 시작합니다.</p>
-                             <p>워크플로우 ID: ${result.workflow_id}</p>`;
+                        document.getElementById('upload-status').innerHTML = `
+                            <div class="upload-item">
+                                <div class="upload-info">
+                                    <div class="upload-filename">✅ ${file.name}</div>
+                                    <div class="upload-meta">업로드 ID: ${result.upload_id || result.workflow_id}</div>
+                                    <span class="upload-status status-created">업로드 완료</span>
+                                </div>
+                            </div>
+                            <p class="success">✅ 업로드 성공! 번역을 시작합니다.</p>
+                        `;
                         
                         // 진행 상황 모니터링 시작
                         monitorProgress(result.workflow_id);
-                        refreshWorkflows();
+                        
+                        // 기록 탭 자동 새로고침
+                        if (currentTab === 'history') {
+                            setTimeout(refreshHistory, 1000);
+                        }
                     } else {
                         throw new Error(result.detail);
                     }
                 } catch (error) {
-                    document.getElementById('upload-status').innerHTML = 
-                        `<p class="error">❌ 업로드 실패: ${error.message}</p>`;
+                    document.getElementById('upload-status').innerHTML = `
+                        <p class="error">❌ 업로드 실패: ${error.message}</p>
+                    `;
                 }
             }
             
+            // 진행 상황 모니터링
             async function monitorProgress(workflowId) {
                 const interval = setInterval(async () => {
                     try {
@@ -586,46 +1100,34 @@ def get_web_interface_html() -> str:
                 }, 2000);
             }
             
+            // 진행 상황 업데이트
             function updateProgressDisplay(workflow) {
                 const statusDiv = document.getElementById('upload-status');
                 
-                // 상세 진행 정보 생성
                 let detailsHtml = '';
                 if (workflow.current_action) {
                     detailsHtml += `<p>📍 현재 작업: ${workflow.current_action}</p>`;
                 }
                 
-                // 페이지 정보 표시
                 if (workflow.total_pages > 0) {
-                    // 레이아웃 분석 단계
                     if (workflow.current_stage === 'LAYOUT_ANALYSIS') {
-                        detailsHtml += `<p>📄 문서 페이지 분석 중: ${workflow.total_pages}개 페이지 발견</p>`;
-                    }
-                    // 번역 단계
-                    else if (workflow.current_stage === 'TRANSLATION' && workflow.current_page > 0) {
+                        detailsHtml += `<p>📄 문서 분석: ${workflow.total_pages}개 페이지</p>`;
+                    } else if (workflow.current_stage === 'TRANSLATION' && workflow.current_page > 0) {
                         detailsHtml += `<p>📄 번역 진행: ${workflow.current_page} / ${workflow.total_pages} 페이지</p>`;
                     }
                 }
                 
-                // 단계별 상세 정보
-                if (workflow.stage_details) {
-                    if (workflow.stage_details.current_file) {
-                        detailsHtml += `<p>📝 현재 파일: ${workflow.stage_details.current_file}</p>`;
-                    }
-                    if (workflow.stage_details.translated_files !== undefined && workflow.stage_details.failed_files !== undefined) {
-                        detailsHtml += `<p>✅ 번역 완료: ${workflow.stage_details.translated_files}개 | ❌ 실패: ${workflow.stage_details.failed_files}개</p>`;
-                    }
-                }
-                
                 const progressHtml = `
-                    <div>
-                        <p>📋 상태: ${getStatusText(workflow.status)}</p>
-                        <p>🔄 단계: ${getStageText(workflow.current_stage)}</p>
-                        ${detailsHtml}
-                        <div class="progress">
-                            <div class="progress-bar" style="width: ${workflow.progress_percentage}%"></div>
+                    <div class="upload-item">
+                        <div class="upload-info">
+                            <div class="upload-filename">📋 상태: ${getStatusText(workflow.status)}</div>
+                            <div class="upload-meta">🔄 단계: ${getStageText(workflow.current_stage)}</div>
+                            ${detailsHtml}
+                            <div class="progress">
+                                <div class="progress-bar" style="width: ${workflow.progress_percentage}%"></div>
+                            </div>
+                            <p>전체 진행률: ${workflow.progress_percentage}%</p>
                         </div>
-                        <p>전체 진행률: ${workflow.progress_percentage}%</p>
                     </div>
                 `;
                 
@@ -637,14 +1139,22 @@ def get_web_interface_html() -> str:
                 }
             }
             
+            // 다운로드 링크 표시
             function showDownloadLink(workflowId) {
                 const statusDiv = document.getElementById('upload-status');
                 statusDiv.innerHTML += `
-                    <p class="success">✅ 번역 완료!</p>
-                    <button onclick="downloadResult('${workflowId}')">📥 결과 다운로드</button>
+                    <div class="upload-item">
+                        <div class="upload-info">
+                            <span class="upload-status status-completed">✅ 번역 완료!</span>
+                        </div>
+                        <div class="upload-actions">
+                            <button class="btn btn-success" onclick="downloadResult('${workflowId}')">📥 결과 다운로드</button>
+                        </div>
+                    </div>
                 `;
             }
             
+            // 에러 표시
             function showError(errorInfo) {
                 const statusDiv = document.getElementById('upload-status');
                 statusDiv.innerHTML += `
@@ -652,6 +1162,126 @@ def get_web_interface_html() -> str:
                 `;
             }
             
+            // 내 기록 새로고침
+            async function refreshHistory() {
+                try {
+                    const response = await fetch('/api/v1/my-uploads');
+                    const data = await response.json();
+                    
+                    // 통계 표시 (방어 코드)
+                    const stats = data && data.statistics ? data.statistics : {};
+                    displayStatistics(stats);
+                    
+                    // 업로드 목록 표시 (방어 코드)
+                    const uploads = Array.isArray(data && data.uploads) ? data.uploads : [];
+                    displayUploadHistory(uploads);
+                    
+                } catch (error) {
+                    console.error('히스토리 조회 실패:', error);
+                    document.getElementById('history-list').innerHTML = `
+                        <p class="error">❌ 기록을 불러올 수 없습니다: ${error.message}</p>
+                    `;
+                }
+            }
+            
+            // 통계 표시
+            function displayStatistics(stats) {
+                stats = stats || {};
+                const statsDiv = document.getElementById('statistics');
+                statsDiv.innerHTML = `
+                    <div class="stat-card">
+                        <div class="stat-number">${stats.total_uploads || 0}</div>
+                        <div class="stat-label">총 업로드</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${stats.completed || 0}</div>
+                        <div class="stat-label">완료</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${stats.processing || 0}</div>
+                        <div class="stat-label">처리중</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">${formatFileSize(stats.total_files_size || 0)}</div>
+                        <div class="stat-label">총 용량</div>
+                    </div>
+                `;
+            }
+            
+            // 업로드 기록 표시
+            function displayUploadHistory(uploads) {
+                const historyDiv = document.getElementById('history-list');
+                
+                if (uploads.length === 0) {
+                    historyDiv.innerHTML = `
+                        <div class="empty-state">
+                            <p>아직 업로드 기록이 없습니다.</p>
+                            <button class="btn btn-primary" onclick="switchTab('upload')">첫 번째 파일 업로드하기</button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                historyDiv.innerHTML = uploads.map(upload => `
+                    <div class="upload-item">
+                        <div class="upload-info">
+                            <div class="upload-filename">📄 ${upload.original_filename}</div>
+                            <div class="upload-meta">
+                                크기: ${formatFileSize(upload.file_size)} | 
+                                업로드: ${formatDateTime(upload.upload_time)}
+                                ${upload.processing_time ? ` | 처리시간: ${upload.processing_time}초` : ''}
+                            </div>
+                            <span class="upload-status status-${upload.status.toLowerCase()}">${getStatusText(upload.status)}</span>
+                            ${upload.progress < 100 && upload.status === 'RUNNING' ? `
+                                <div class="upload-progress">
+                                    <div class="upload-progress-bar" style="width: ${upload.progress}%"></div>
+                                </div>
+                            ` : ''}
+                            ${upload.error_message ? `<p class="error">❌ ${upload.error_message}</p>` : ''}
+                        </div>
+                        <div class="upload-actions">
+                            <button class="btn btn-secondary" onclick="viewUploadDetail('${upload.id}')">상세보기</button>
+                            ${upload.status === 'COMPLETED' ? 
+                                `<button class="btn btn-success" onclick="downloadUploadResult('${upload.id}')">다운로드</button>` : 
+                                ''}
+                            <button class="btn btn-danger" onclick="deleteUpload('${upload.id}')">삭제</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            // 현재 작업 새로고침
+            async function refreshCurrentWorkflows() {
+                try {
+                    const response = await fetch('/api/v1/workflows/');
+                    const stats = await response.json();
+                    
+                    document.getElementById('current-workflows').innerHTML = `
+                        <div class="statistics">
+                            <div class="stat-card">
+                                <div class="stat-number">${stats.running}</div>
+                                <div class="stat-label">실행중</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${stats.total}</div>
+                                <div class="stat-label">전체</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${stats.completed}</div>
+                                <div class="stat-label">완료</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-number">${stats.failed}</div>
+                                <div class="stat-label">실패</div>
+                            </div>
+                        </div>
+                    `;
+                } catch (error) {
+                    console.error('현재 작업 조회 실패:', error);
+                }
+            }
+            
+            // 결과 다운로드
             async function downloadResult(workflowId) {
                 try {
                     const response = await fetch(`/api/v1/workflows/${workflowId}/download`);
@@ -671,22 +1301,59 @@ def get_web_interface_html() -> str:
                 }
             }
             
-            async function refreshWorkflows() {
+            // 업로드 결과 다운로드
+            async function downloadUploadResult(uploadId) {
                 try {
-                    const response = await fetch('/api/v1/workflows/');
-                    const stats = await response.json();
-                    
-                    document.getElementById('workflows-list').innerHTML = `
-                        <div class="workflow-item">
-                            <h3>📊 전체 통계</h3>
-                            <p>전체: ${stats.total} | 실행중: ${stats.running} | 완료: ${stats.completed} | 실패: ${stats.failed}</p>
-                        </div>
-                    `;
+                    const response = await fetch(`/api/v1/uploads/${uploadId}/download`);
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `translation_result_${uploadId}.zip`;
+                        a.click();
+                        window.URL.revokeObjectURL(url);
+                    } else {
+                        alert('다운로드 실패');
+                    }
                 } catch (error) {
-                    console.error('Failed to refresh workflows:', error);
+                    alert('다운로드 오류: ' + error.message);
                 }
             }
             
+            // 업로드 삭제
+            async function deleteUpload(uploadId) {
+                if (!confirm('이 업로드 기록을 삭제하시겠습니까?')) return;
+                
+                try {
+                    const response = await fetch(`/api/v1/uploads/${uploadId}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    if (response.ok) {
+                        refreshHistory();
+                        alert('업로드 기록이 삭제되었습니다.');
+                    } else {
+                        alert('삭제 실패');
+                    }
+                } catch (error) {
+                    alert('삭제 오류: ' + error.message);
+                }
+            }
+            
+            // 업로드 상세보기
+            async function viewUploadDetail(uploadId) {
+                try {
+                    const response = await fetch(`/api/v1/uploads/${uploadId}`);
+                    const data = await response.json();
+                    
+                    alert(`상세 정보:\n업로드 ID: ${data.upload.id}\n파일명: ${data.upload.original_filename}\n상태: ${data.upload.status}\n진행률: ${data.upload.progress}%`);
+                } catch (error) {
+                    alert('상세 정보 조회 실패: ' + error.message);
+                }
+            }
+            
+            // 유틸리티 함수들
             function getStatusText(status) {
                 const statusMap = {
                     'CREATED': '생성됨',
@@ -707,8 +1374,30 @@ def get_web_interface_html() -> str:
                 return stageMap[stage] || stage;
             }
             
-            // 페이지 로드 시 워크플로우 목록 조회
-            refreshWorkflows();
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 Bytes';
+                const k = 1024;
+                const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+            
+            function formatDateTime(dateTimeStr) {
+                const date = new Date(dateTimeStr);
+                return date.toLocaleString('ko-KR');
+            }
+            
+            // 페이지 로드 시 초기화
+            window.addEventListener('load', function() {
+                // 자동 새로고침 설정
+                setInterval(() => {
+                    if (currentTab === 'history') {
+                        refreshHistory();
+                    } else if (currentTab === 'status') {
+                        refreshCurrentWorkflows();
+                    }
+                }, 10000); // 10초마다 자동 새로고침
+            });
         </script>
     </body>
     </html>
