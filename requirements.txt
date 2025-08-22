@@ -1,0 +1,27 @@
+# requirements.txt
+
+# OCR 및 이미지 처리
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0
+PyMuPDF>=1.23.0  # PDF 페이지별 처리를 위한 라이브러리
+
+# 번역 및 API 클라이언트
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+
+# FastAPI 및 웹 서버
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# 테스트
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
+
+# 유틸리티
+python-dotenv>=1.0.0
+
+
+

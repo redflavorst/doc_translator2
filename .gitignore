@@ -1,0 +1,115 @@
+# .gitignore
+
+# Python 관련
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.manifest
+*.spec
+
+# 가상환경
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 환경 설정 (민감한 정보)
+.env
+.env.local
+.env.*.local
+# .env.example은 유지
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 프로젝트 특정 디렉토리
+uploads/           # 업로드된 PDF 파일들
+outputs/           # 처리 결과 파일들
+temp_data/         # 임시 파일들
+workflow_states/   # 워크플로우 상태 파일들
+test_output*/      # 테스트 출력 디렉토리
+test_layout/       # 테스트 레이아웃 파일들
+logs/              # 로그 파일들
+
+# 샘플 데이터
+*.pdf              # 모든 PDF 파일
+*.docx             # Word 파일
+*.xlsx             # Excel 파일
+*.pptx             # PowerPoint 파일
+
+# 출력 파일
+*.md               # 마크다운 파일 (README.md 제외)
+!README.md         # README.md는 유지
+*.json             # JSON 파일 (package.json, requirements.json 등 제외)
+!package.json
+!package-lock.json
+!tsconfig.json
+*.jpg
+*.jpeg
+*.png
+*.gif
+!docs/*.png        # 문서용 이미지는 유지
+
+# PaddleOCR 모델 캐시
+.paddleocr/
+.paddlex/
+C:\\Users\\*\\.paddlex\\    # Windows 사용자 폴더의 paddlex
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 테스트 관련
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# 데이터베이스
+*.db
+*.sqlite
+*.sqlite3
+
+# 백업 파일
+*.bak
+*.backup
+*.old
+
+# 압축 파일
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# 기타
+.python-version
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
