@@ -1,7 +1,7 @@
-# services/layout_analysis_service_paged.py
+# services/layout_analysis_service_paged.py (동시성 문제 해결)
 """
-페이지별 진행률 추적이 가능한 레이아웃 분석 서비스 (테스트용)
-PPStructureV3 모델은 한 번만 로드하고 각 페이지마다 재사용
+페이지별 진행률 추적이 가능한 레이아웃 분석 서비스 (동시 사용자 지원)
+각 스레드마다 별도의 PPStructureV3 모델 인스턴스를 사용하여 동시성 문제 해결
 """
 
 import json
@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import traceback
 import tempfile
 import shutil
+import threading
 
 try:
     import fitz  # PyMuPDF for PDF page extraction
@@ -37,7 +38,10 @@ class LayoutAnalysisResult:
 
 
 class LayoutAnalysisServicePaged:
-    """페이지별 진행률 추적이 가능한 레이아웃 분석 서비스"""
+    """
+    페이지별 진행률 추적이 가능한 레이아웃 분석 서비스 (멀티 스레드 안전)
+    각 스레드마다 독립적인 PaddleOCR 인스턴스를 사용
+    """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
@@ -47,47 +51,69 @@ class LayoutAnalysisServicePaged:
         self.use_gpu = self.config.get('use_gpu', False)
         self.use_table = self.config.get('use_table', True)
         
-        # PP-Structure 파이프라인 (싱글톤)
-        self._pipeline = None
+        # 스레드별 로컬 스토리지 (각 스레드마다 별도 모델 인스턴스)
+        self._local = threading.local()
+        
+        # 전역 모델 로드 카운터 (디버깅용)
+        self._model_load_count = 0
+        self._lock = threading.Lock()
         
     def _get_pipeline(self, progress_callback=None):
-        """PP-Structure 파이프라인 초기화 (한 번만 로드)"""
-        if self._pipeline is None:
+        """스레드별 PP-Structure 파이프라인 획득"""
+        
+        # 현재 스레드에 파이프라인이 없는 경우에만 생성
+        if not hasattr(self._local, 'pipeline') or self._local.pipeline is None:
             try:
                 from paddleocr import PPStructureV3
                 
-                # 모델 로딩 진행 상황 알림
-                if progress_callback:
-                    progress_callback(0, 100, "분석 모델 로드 중... (최초 1회)")
+                # 스레드 정보
+                thread_id = threading.current_thread().ident
+                thread_name = threading.current_thread().name
                 
-                # 모델은 최초 1회만 로드
-                print("="*50)
-                print("PPStructureV3 모델 로드 시작... (최초 1회만)")
+                with self._lock:
+                    self._model_load_count += 1
+                    current_count = self._model_load_count
+                
+                print(f"\n{'='*60}")
+                print(f"🔄 스레드별 PPStructureV3 모델 로드")
+                print(f"   스레드 ID: {thread_id}")
+                print(f"   스레드 이름: {thread_name}")
+                print(f"   로드 순서: {current_count}번째")
+                print(f"{'='*60}")
+                
+                if progress_callback:
+                    progress_callback(0, 100, f"분석 모델 로드 중... (스레드 {current_count})")
+                
                 start_load = time.time()
                 
-                self._pipeline = PPStructureV3(
-                    device='cpu',
+                # 스레드별 독립적인 모델 인스턴스 생성
+                self._local.pipeline = PPStructureV3(
+                    device='cpu',  # CPU 사용으로 안정성 확보
                     use_table_recognition=self.use_table,
                     use_doc_unwarping=False,  # UVDoc 비활성화
-                    use_doc_orientation_classify=False
+                    use_doc_orientation_classify=False  # 방향 분류 비활성화
                 )
                 
                 load_time = time.time() - start_load
-                print(f"PPStructureV3 모델 로드 완료! (소요시간: {load_time:.2f}초)")
-                print("="*50)
+                
+                print(f"✅ 스레드 {thread_id}: 모델 로드 완료!")
+                print(f"   소요시간: {load_time:.2f}초")
+                print(f"   메모리 사용: 독립 인스턴스")
+                print(f"{'='*60}\n")
                 
                 if progress_callback:
                     progress_callback(100, 100, "분석 모델 로드 완료")
-                
+                        
             except Exception as e:
+                print(f"❌ 스레드 {thread_id}: 모델 로드 실패: {e}")
                 raise RuntimeError(f"PPStructureV3 초기화 실패: {e}")
                 
-        return self._pipeline
+        return self._local.pipeline
     
     def analyze_document(self, pdf_path: str, output_dir: str = None, 
                         progress_callback=None) -> LayoutAnalysisResult:
         """
-        PDF 문서를 페이지별로 분석 (실시간 진행률 추적)
+        PDF 문서를 페이지별로 분석 (스레드 안전)
         
         Args:
             pdf_path: PDF 파일 경로
@@ -106,6 +132,9 @@ class LayoutAnalysisServicePaged:
             )
         
         start_time = time.time()
+        thread_id = threading.current_thread().ident
+        
+        print(f"\n📄 스레드 {thread_id}: PDF 분석 시작")
         
         try:
             pdf_path = Path(pdf_path).resolve()
@@ -123,7 +152,7 @@ class LayoutAnalysisServicePaged:
             return self._analyze_by_pages(pdf_path, output_dir, progress_callback, start_time)
                 
         except Exception as e:
-            self.logger.error(f"레이아웃 분석 실패: {e}")
+            self.logger.error(f"스레드 {thread_id}: 레이아웃 분석 실패: {e}")
             traceback.print_exc()
             return LayoutAnalysisResult(
                 success=False,
@@ -137,17 +166,18 @@ class LayoutAnalysisServicePaged:
     
     def _analyze_by_pages(self, pdf_path: Path, output_dir: Path, 
                          progress_callback, start_time: float) -> LayoutAnalysisResult:
-        """페이지별로 분할하여 처리 (실시간 진행률 추적)"""
+        """페이지별로 분할하여 처리 (스레드별 독립 실행)"""
         
-        print(f"\n📄 PDF 페이지별 분석 시작: {pdf_path.name}")
+        thread_id = threading.current_thread().ident
+        print(f"📊 스레드 {thread_id}: 페이지별 분석 시작 - {pdf_path.name}")
         
-        # 모델 로드 (한 번만!) - 진행 상황 알림
+        # 스레드별 모델 인스턴스 로드
         pipeline = self._get_pipeline(progress_callback)
         
         # PDF 열기
         doc = fitz.open(str(pdf_path))
         total_pages = len(doc)
-        print(f"총 페이지 수: {total_pages}")
+        print(f"📑 스레드 {thread_id}: 총 페이지 수 - {total_pages}")
         
         if progress_callback:
             progress_callback(0, total_pages, f"PDF 분석 준비 중... (총 {total_pages}페이지)")
@@ -155,8 +185,8 @@ class LayoutAnalysisServicePaged:
         all_pages = []
         markdown_files = []
         
-        # 임시 디렉토리 생성
-        temp_dir = output_dir / "temp_images"
+        # 임시 디렉토리 생성 (스레드별로 독립)
+        temp_dir = output_dir / f"temp_images_{thread_id}"
         temp_dir.mkdir(exist_ok=True)
         
         try:
@@ -166,7 +196,7 @@ class LayoutAnalysisServicePaged:
                     page_start = time.time()
                     current_page = page_num + 1
                     
-                    print(f"\n--- 페이지 {current_page}/{total_pages} 처리 시작 ---")
+                    print(f"📄 스레드 {thread_id}: 페이지 {current_page}/{total_pages} 처리 시작")
                     
                     if progress_callback:
                         progress_callback(page_num, total_pages, 
@@ -178,16 +208,16 @@ class LayoutAnalysisServicePaged:
                     pix = page.get_pixmap(matrix=matrix)
                     temp_img_path = temp_dir / f"page_{current_page:04d}.png"
                     pix.save(str(temp_img_path))
-                    print(f"  이미지 추출 완료: {temp_img_path.name}")
+                    print(f"  🖼️ 스레드 {thread_id}: 이미지 추출 완료 - {temp_img_path.name}")
                     
                     if progress_callback:
                         progress_callback(page_num, total_pages, 
                                         f"페이지 {current_page}/{total_pages} 레이아웃 분석 중...")
                     
-                    # 단일 페이지 분석 (이미 로드된 모델 사용)
-                    print(f"  레이아웃 분석 시작...")
+                    # 단일 페이지 분석 (스레드별 독립 모델 사용)
+                    print(f"  🔍 스레드 {thread_id}: 레이아웃 분석 시작...")
                     result = pipeline.predict(input=str(temp_img_path))
-                    print(f"  레이아웃 분석 완료")
+                    print(f"  ✅ 스레드 {thread_id}: 레이아웃 분석 완료")
                     
                     if progress_callback:
                         progress_callback(page_num, total_pages, 
@@ -197,7 +227,7 @@ class LayoutAnalysisServicePaged:
                     md_path = self._process_page_result(result, current_page, output_dir)
                     if md_path:
                         markdown_files.append(str(md_path))
-                        print(f"  마크다운 저장: {md_path.name}")
+                        print(f"  📝 스레드 {thread_id}: 마크다운 저장 - {md_path.name}")
                     
                     # 페이지별 JSON 결과 저장
                     json_path = output_dir / f"page_{current_page:04d}_result.json"
@@ -210,21 +240,23 @@ class LayoutAnalysisServicePaged:
                         "page_number": current_page,
                         "markdown_file": str(md_path) if md_path else None,
                         "json_file": str(json_path),
-                        "processing_time": page_time
+                        "processing_time": page_time,
+                        "thread_id": thread_id
                     })
                     
-                    print(f"  페이지 처리 완료 (소요시간: {page_time:.2f}초)")
+                    print(f"  ⏱️ 스레드 {thread_id}: 페이지 처리 완료 (소요시간: {page_time:.2f}초)")
                     
                     if progress_callback:
                         progress_callback(current_page, total_pages, 
                                         f"페이지 {current_page}/{total_pages} 완료")
                     
                 except Exception as e:
-                    print(f"  ❌ 페이지 {current_page} 처리 실패: {e}")
-                    self.logger.warning(f"페이지 {current_page} 처리 실패: {e}")
+                    print(f"  ❌ 스레드 {thread_id}: 페이지 {current_page} 처리 실패: {e}")
+                    self.logger.warning(f"스레드 {thread_id}: 페이지 {current_page} 처리 실패: {e}")
                     all_pages.append({
                         "page_number": current_page,
-                        "error": str(e)
+                        "error": str(e),
+                        "thread_id": thread_id
                     })
             
             # 임시 디렉토리 정리
@@ -234,10 +266,11 @@ class LayoutAnalysisServicePaged:
             doc.close()
         
         total_time = time.time() - start_time
-        print(f"\n✅ 전체 분석 완료!")
-        print(f"총 소요시간: {total_time:.2f}초")
-        print(f"페이지당 평균: {total_time/total_pages:.2f}초")
-        print(f"생성된 마크다운 파일: {len(markdown_files)}개")
+        print(f"\n✅ 스레드 {thread_id}: 전체 분석 완료!")
+        print(f"   총 소요시간: {total_time:.2f}초")
+        print(f"   페이지당 평균: {total_time/total_pages:.2f}초")
+        print(f"   생성된 마크다운 파일: {len(markdown_files)}개")
+        print(f"   스레드 독립성: 확보됨")
         
         return LayoutAnalysisResult(
             success=True,
@@ -248,13 +281,15 @@ class LayoutAnalysisServicePaged:
             output_dir=str(output_dir),
             metadata={
                 "total_pages": total_pages,
-                "method": "page_by_page",
-                "avg_page_time": total_time / total_pages if total_pages > 0 else 0
+                "method": "page_by_page_threaded",
+                "thread_id": thread_id,
+                "avg_page_time": total_time / total_pages if total_pages > 0 else 0,
+                "concurrent_processing": True
             }
         )
     
     def _process_page_result(self, result, page_num: int, output_dir: Path) -> Optional[Path]:
-        """단일 페이지 결과를 마크다운으로 변환"""
+        """단일 페이지 결과를 마크다운으로 변환 (스레드 안전)"""
         try:
             md_text = ""
             
@@ -277,32 +312,63 @@ class LayoutAnalysisServicePaged:
             if not md_text.strip():
                 md_text = f"# Page {page_num}\n\n[No text content detected]"
             
-            # 마크다운 파일 저장
+            # 마크다운 파일 저장 (스레드 안전)
             md_path = output_dir / f"page_{page_num:04d}.md"
             md_path.write_text(md_text, encoding='utf-8')
             
             return md_path
             
         except Exception as e:
-            self.logger.error(f"페이지 {page_num} 마크다운 변환 실패: {e}")
+            thread_id = threading.current_thread().ident
+            self.logger.error(f"스레드 {thread_id}: 페이지 {page_num} 마크다운 변환 실패: {e}")
             traceback.print_exc()
             return None
+    
+    def get_thread_info(self) -> Dict[str, Any]:
+        """현재 스레드의 모델 정보 반환 (디버깅용)"""
+        thread_id = threading.current_thread().ident
+        thread_name = threading.current_thread().name
+        has_pipeline = hasattr(self._local, 'pipeline') and self._local.pipeline is not None
+        
+        return {
+            "thread_id": thread_id,
+            "thread_name": thread_name,
+            "has_pipeline": has_pipeline,
+            "total_models_loaded": self._model_load_count
+        }
 
 
-def test_paged_analysis():
-    """테스트 함수"""
+def test_concurrent_analysis():
+    """동시성 테스트 함수"""
     import sys
+    import threading
+    import time
     
     def progress_callback(current, total, message):
         """진행률 표시 콜백"""
+        thread_id = threading.current_thread().ident
         if total > 0:
             percent = (current / total) * 100
-            bar_length = 40
-            filled = int(bar_length * current / total)
-            bar = '█' * filled + '░' * (bar_length - filled)
-            print(f"\r[{bar}] {percent:.1f}% - {message}", end='', flush=True)
-            if current == total:
-                print()  # 완료 시 줄바꿈
+            print(f"스레드 {thread_id}: [{percent:.1f}%] {message}")
+    
+    def analyze_worker(service, pdf_path, worker_id):
+        """워커 스레드 함수"""
+        print(f"\n🚀 워커 {worker_id} 시작")
+        
+        result = service.analyze_document(
+            pdf_path,
+            output_dir=f"./test_output_worker_{worker_id}_{int(time.time())}",
+            progress_callback=progress_callback
+        )
+        
+        if result.success:
+            print(f"✅ 워커 {worker_id} 성공!")
+            print(f"   처리된 페이지: {len(result.pages)}")
+            print(f"   생성된 마크다운: {len(result.markdown_files)}")
+            print(f"   처리 시간: {result.processing_time:.2f}초")
+            print(f"   스레드 정보: {result.metadata.get('thread_id')}")
+        else:
+            print(f"❌ 워커 {worker_id} 실패: {result.error}")
     
     # 테스트 실행
     if len(sys.argv) > 1:
@@ -310,21 +376,33 @@ def test_paged_analysis():
     else:
         pdf_path = input("PDF 파일 경로를 입력하세요: ")
     
-    service = LayoutAnalysisServicePaged()
-    result = service.analyze_document(
-        pdf_path,
-        output_dir=f"./test_output_paged_{int(time.time())}",
-        progress_callback=progress_callback
-    )
+    if not Path(pdf_path).exists():
+        print(f"❌ 파일이 존재하지 않습니다: {pdf_path}")
+        return
     
-    if result.success:
-        print(f"\n✅ 분석 성공!")
-        print(f"처리된 페이지: {len(result.pages)}")
-        print(f"생성된 마크다운: {len(result.markdown_files)}")
-        print(f"출력 디렉토리: {result.output_dir}")
-    else:
-        print(f"\n❌ 분석 실패: {result.error}")
+    service = LayoutAnalysisServicePaged()
+    
+    # 동시에 2개 워커 실행
+    print("🔄 동시성 테스트: 2개 워커 동시 실행")
+    
+    threads = []
+    for i in range(2):
+        thread = threading.Thread(
+            target=analyze_worker,
+            args=(service, pdf_path, i+1),
+            name=f"Worker-{i+1}"
+        )
+        threads.append(thread)
+        thread.start()
+        time.sleep(1)  # 1초 간격으로 시작
+    
+    # 모든 스레드 완료 대기
+    for thread in threads:
+        thread.join()
+    
+    print("\n🎯 동시성 테스트 완료!")
+    print(f"총 로드된 모델 수: {service._model_load_count}")
 
 
 if __name__ == "__main__":
-    test_paged_analysis()
+    test_concurrent_analysis()
