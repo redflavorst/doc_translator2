@@ -293,21 +293,37 @@ class LayoutAnalysisServicePaged:
         try:
             md_text = ""
             
-            # 결과에서 마크다운 텍스트 추출
+            # 결과에서 마크다운 텍스트 추출 (오직 'markdown_texts' 값만 저장)
             if isinstance(result, list):
                 for item in result:
                     if hasattr(item, 'markdown'):
-                        md_text += str(item.markdown) + "\n"
+                        md_info = getattr(item, 'markdown')
+                        if isinstance(md_info, dict):
+                            txt = md_info.get('markdown_texts') or md_info.get('markdown') or ''
+                            md_text += str(txt or '') + "\n"
+                        else:
+                            md_text += str(md_info or '') + "\n"
                     elif isinstance(item, dict):
-                        if 'markdown' in item:
-                            md_text += str(item['markdown']) + "\n"
-                        if 'text' in item:
-                            md_text += str(item['text']) + "\n"
+                        md_info = item.get('markdown')
+                        if isinstance(md_info, dict):
+                            txt = md_info.get('markdown_texts') or md_info.get('markdown') or ''
+                            md_text += str(txt or '') + "\n"
+                        elif 'text' in item:
+                            md_text += str(item.get('text') or '') + "\n"
             elif hasattr(result, 'markdown'):
-                md_text = str(result.markdown)
+                md_info = getattr(result, 'markdown')
+                if isinstance(md_info, dict):
+                    md_text = str(md_info.get('markdown_texts') or md_info.get('markdown') or '')
+                else:
+                    md_text = str(md_info or '')
+            elif isinstance(result, dict):
+                md_info = result.get('markdown')
+                if isinstance(md_info, dict):
+                    md_text = str(md_info.get('markdown_texts') or md_info.get('markdown') or '')
+                else:
+                    md_text = ''
             else:
-                # 결과를 문자열로 변환
-                md_text = str(result)
+                md_text = ''
             
             if not md_text.strip():
                 md_text = f"# Page {page_num}\n\n[No text content detected]"
