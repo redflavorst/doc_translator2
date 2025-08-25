@@ -60,17 +60,17 @@ class TranslationService:
         
         # 표 번역 배치 설정 (quality_contract_translator 기준 값 차용)
         self.SHORT_CELL_MAX_CHARS = 50
-        self.SHORT_CELL_BATCH_SIZE = 120
+        self.SHORT_CELL_BATCH_SIZE = 10  # 120 -> 10으로 감소 (안정성 향상)
         self.MEDIUM_CELL_MAX_CHARS = 200  # 새로 추가
         self.LONG_CELL_MAX_CHARS = 1000  # 새로 추가
-        self.MAX_CHARS_PER_BATCH = 2000
+        self.MAX_CHARS_PER_BATCH = 1500  # 2000 -> 1500으로 감소
         
-        # 배치 크기 동적 설정
+        # 배치 크기 동적 설정 (더 작은 배치로 안정적 처리)
         self.CELL_BATCH_CONFIGS = {
-            'short': {'batch_size': 20, 'num_predict': 500},
-            'medium': {'batch_size': 10, 'num_predict': 1000},
-            'long': {'batch_size': 3, 'num_predict': 2000},
-            'extra_long': {'batch_size': 1, 'num_predict': 4000}
+            'short': {'batch_size': 10, 'num_predict': 1500},  # 배치 20->8, 토큰 500->2000
+            'medium': {'batch_size': 5, 'num_predict': 2000},  # 배치 10->5, 토큰 1000->3000
+            'long': {'batch_size': 3, 'num_predict': 3000},   # 배치 3->2
+            'extra_long': {'batch_size': 1, 'num_predict': 4000}  # 토큰 4000->6000
         }
 
 
@@ -604,7 +604,7 @@ class TranslationService:
 
 
     def _batch_translate_cells(self, session: requests.Session, cells_info: List[Dict], config: Dict) -> None:
-        """짧은/중간 셀 배치 처리"""
+        """짧은/중간 셀 배치 처리 - 줄 기반 형식 사용"""
         batch_size = config['batch_size']
 
         for i in range(0, len(cells_info), batch_size):
@@ -619,22 +619,15 @@ class TranslationService:
             if not to_translate:
                 continue
 
-            # JSON 배치 생성
-            items = [{"id":f"c{j}", "text":info['text']} for j, info in enumerate(to_translate)]
+            # 줄 기반 배치 번역 실행
+            texts = [info['text'] for info in to_translate]
+            translated_texts = self._translate_batch_line_based(session, texts, config)
 
-            #동적 토큰 계산
-            total_chars = sum(len(info['text']) for info in to_translate)
-            num_predict = min(total_chars*2, config['num_predict'])
-
-            #번역 실행
-            results = self._translate_batch_json_adaptive(session, items, num_predict=num_predict)
-
-            # 결과 적용
-            for info, item in zip(to_translate, items):
-                translated = results.get(item['id'], info['text'])
+            # 결과 적용 (원래 셀 위치에 번역된 텍스트 삽입)
+            for info, translated in zip(to_translate, translated_texts):
                 cache_key = self._cache_key(info['text'])
                 self._cell_cache[cache_key] = translated
-                info['cell'].string = translated
+                info['cell'].string = translated  # HTML 테이블 셀에 직접 삽입
 
     def _translate_long_cells(self, session: requests.Session, 
                          cells_info: List[Dict], config: Dict) -> None:
@@ -761,11 +754,122 @@ class TranslationService:
         
         return '\n'.join(translated_groups)
     
+    def _translate_batch_line_based(self, session: requests.Session, 
+                                   texts: List[str], config: Dict) -> List[str]:
+        """줄 기반 배치 번역 - 더 안정적이고 빠름"""
+        if not texts:
+            return []
+        
+        # 배치가 너무 크면 분할
+        if len(texts) > 5:
+            mid = len(texts) // 2
+            part1 = self._translate_batch_line_based(session, texts[:mid], config)
+            part2 = self._translate_batch_line_based(session, texts[mid:], config)
+            return part1 + part2
+        
+        # 줄 기반 형식으로 프롬프트 생성
+        input_lines = []
+        for i, text in enumerate(texts):
+            input_lines.append(f"[{i}] {text}")
+        
+        prompt = f"""Translate each line to Korean. Keep the same [number] format.
+Input:
+{chr(10).join(input_lines)}
+
+Output (Korean translation with same [number] format):"""
+        
+        # Ollama 호출
+        data = {
+            'model': self.model_name,
+            'prompt': prompt,
+            'stream': False,
+            'options': {
+                'temperature': 0.1,
+                'num_predict': max(2000, len(prompt) * 3),  # 최소 2000 토큰 보장
+                'num_ctx': 8192,
+                'top_p': 0.95
+            }
+        }
+        
+        print(f"\n=== 배치 번역 시도 ===")
+        print(f"텍스트 개수: {len(texts)}")
+        print(f"프롬프트 길이: {len(prompt)}")
+        print(f"num_predict: {data['options']['num_predict']}")
+        
+        try:
+            response = session.post(
+                f'{self.ollama_url}/api/generate',
+                json=data,
+                timeout=120
+            )
+            
+            if response.status_code == 200:
+                result_text = response.json().get('response', '')
+                print(f"응답 길이: {len(result_text)}")
+                print(f"응답 샘플: {result_text[:200]}...")
+                
+                # 줄 기반 파싱
+                translated_texts = self._parse_line_based_response(result_text, len(texts))
+                if len(translated_texts) == len(texts):
+                    print(f"✅ 배치 번역 성공!")
+                    return translated_texts
+                else:
+                    print(f"⚠️ 파싱 실패: 기대 {len(texts)}개, 실제 {len(translated_texts)}개")
+                    print(f"파싱된 내용: {translated_texts}")
+            else:
+                print(f"❌ HTTP 에러: {response.status_code}")
+                    
+        except Exception as e:
+            print(f"❌ 예외 발생: {type(e).__name__}: {e}")
+        
+        # 실패 시 개별 번역
+        print(f"배치 실패, 개별 번역으로 전환 ({len(texts)}개)")
+        result = []
+        for text in texts:
+            try:
+                translated, _ = self._translate_chunk_ollama(session, text, 1, 1)
+                result.append(translated)
+            except Exception as e:
+                print(f"개별 번역 실패: {e}")
+                result.append(text)
+        return result
+    
+    def _parse_line_based_response(self, response: str, expected_count: int) -> List[str]:
+        """줄 기반 응답 파싱"""
+        lines = response.strip().split('\n')
+        result = [''] * expected_count
+        found_count = 0
+        
+        for line in lines:
+            # [0] 번역된 텍스트 형식 파싱
+            match = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
+            if match:
+                idx = int(match.group(1))
+                text = match.group(2).strip()
+                if 0 <= idx < expected_count and text:  # 빈 텍스트 제외
+                    result[idx] = text
+                    found_count += 1
+                    print(f"  파싱됨 [{idx}]: {text[:50]}...")
+        
+        print(f"  파싱 결과: {found_count}/{expected_count} 항목")
+        
+        # 모든 항목이 번역되었는지 확인
+        if all(text for text in result):
+            return result
+        return []
+
     def _translate_batch_json_adaptive(self, session: requests.Session, 
                                   items: List[Dict], num_predict: int) -> Dict[str, str]:
         """적응형 JSON 배치 번역"""
         if not items:
             return {}
+        
+        # 배치가 너무 크면 분할 처리
+        if len(items) > 10:
+            mid = len(items) // 2
+            part1 = self._translate_batch_json_adaptive(session, items[:mid], num_predict)
+            part2 = self._translate_batch_json_adaptive(session, items[mid:], num_predict)
+            return {**part1, **part2}
         
         prompt = f"""
         다음 항목들을 한국어로 번역하세요.
@@ -785,8 +889,8 @@ class TranslationService:
             'format': 'json',
             'options': {
                 'temperature': 0.1,
-                'num_predict': num_predict,
-                'num_ctx': 4096  # 컨텍스트 윈도우 확대
+                'num_predict': max(num_predict, len(json.dumps(items)) * 2),  # 동적 토큰 보장
+                'num_ctx': 8192  # 컨텍스트 윈도우 확대 4096 -> 8192
             }
         }
         
@@ -799,14 +903,24 @@ class TranslationService:
             
             if response.status_code == 200:
                 result_text = response.json().get('response', '')
-                # JSON 파싱
-                result_data = json.loads(result_text)
-                return {item['id']: item.get('translated', '') 
-                    for item in result_data}
+                parsed = self._parse_id_translated_map(result_text)
+                if parsed and len(parsed) >= len(items) * 0.8:  # 80% 이상 성공 시만 반환
+                    return parsed
         except Exception as e:
             print(f"배치 번역 실패: {e}")
-            
-        return {}
+        
+        # 실패 시 개별 번역 폴백
+        print(f"배치 번역 실패, 개별 번역으로 전환 ({len(items)}개)")
+        result = {}
+        for item in items:
+            try:
+                translated, _ = self._translate_chunk_ollama(
+                    session, item['text'], 1, 1
+                )
+                result[item['id']] = translated
+            except Exception:
+                result[item['id']] = item['text']
+        return result
 
     # -------------------- LLM 호출 유틸 --------------------
     def _translate_batch_json(self, session: requests.Session, items: List[Dict[str, str]], fast: bool = True) -> Dict[str, str]:
@@ -820,24 +934,74 @@ class TranslationService:
         examples = json.dumps(items, ensure_ascii=False)
         prompt = f"{instruction}\n\nINPUT:\n{examples}\n\nOUTPUT:"
         resp = self._generate_once_fast(session, prompt) if fast else self._generate_once(session, prompt)
+        parsed = self._parse_id_translated_map(resp)
+        if parsed:
+            return parsed
+        # 폴백: 한 개씩 처리
+        out: Dict[str, str] = {}
+        for obj in items:
+            text = obj["text"]
+            single = self._generate_once(
+                session,
+                "Translate to Korean. Return ONLY the translated text, no explanations:\n" +
+                f"{text}\n\nOUTPUT:"
+            ) or text
+            out[obj["id"]] = self._strip_meta(single)
+        return out
+
+    def _parse_id_translated_map(self, resp_text: Optional[str]) -> Dict[str, str]:
+        """모델 응답에서 id→translated 매핑을 견고하게 추출."""
+        out: Dict[str, str] = {}
+        if not resp_text:
+            return out
+        text = resp_text.strip()
+        # 배열 부분만 추출 시도
+        m = re.search(r'\[.*\]', text, flags=re.DOTALL)
+        candidate = m.group(0) if m else text
+        data = None
+        # 1차 디코드
         try:
-            m = re.search(r'\[.*\]', resp or '', flags=re.DOTALL)
-            payload = m.group(0) if m else (resp or '[]')
-            data = json.loads(payload)
-            out = {d.get('id'): d.get('translated', '') for d in data if isinstance(d, dict)}
-            return out
+            data = json.loads(candidate)
         except Exception:
-            # 폴백: 한 개씩 처리
-            out: Dict[str, str] = {}
-            for obj in items:
-                text = obj["text"]
-                single = self._generate_once(
-                    session,
-                    "Translate to Korean. Return ONLY the translated text, no explanations:\n" +
-                    f"{text}\n\nOUTPUT:"
-                ) or text
-                out[obj["id"]] = self._strip_meta(single)
-            return out
+            pass
+        # 이중 인코딩 처리
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                data = None
+        # 리스트 형태
+        if isinstance(data, list):
+            for elem in data:
+                if isinstance(elem, dict):
+                    _id = elem.get('id')
+                    _tr = elem.get('translated')
+                    if isinstance(_id, str) and isinstance(_tr, str):
+                        out[_id] = _tr
+        # dict 형태 (items 리스트 또는 매핑)
+        elif isinstance(data, dict):
+            items = data.get('items') or data.get('data')
+            if isinstance(items, list):
+                for elem in items:
+                    if isinstance(elem, dict):
+                        _id = elem.get('id')
+                        _tr = elem.get('translated')
+                        if isinstance(_id, str) and isinstance(_tr, str):
+                            out[_id] = _tr
+            else:
+                # {id: translated} 매핑 형태 허용
+                ok = True
+                for k, v in data.items():
+                    if not isinstance(k, str) or not isinstance(v, str):
+                        ok = False
+                        break
+                if ok:
+                    return dict(data)
+        # 정규식 폴백
+        if not out:
+            for rm in re.finditer(r'"id"\s*:\s*"([^"]+)"[\s\S]*?"translated"\s*:\s*"([\s\S]*?)"', text):
+                out[rm.group(1)] = rm.group(2)
+        return out
 
     def _generate_once_fast(self, session: requests.Session, prompt: str) -> Optional[str]:
         payload = {
@@ -848,14 +1012,15 @@ class TranslationService:
             "options": {
                 "temperature": 0.0,
                 "top_p": 1.0,
-                "num_predict": 256
+                "num_predict": 4096,  # 256 -> 4096으로 증가
+                "num_ctx": 8192  # 컨텍스트 윈도우 추가
             },
         }
         try:
             response = session.post(
                 f"{self.ollama_url}/api/generate",
                 json=payload,
-                timeout=60,
+                timeout=120,  # 60 -> 120초로 증가
             )
             if response.status_code == 200:
                 raw = response.json().get("response", "").strip()
