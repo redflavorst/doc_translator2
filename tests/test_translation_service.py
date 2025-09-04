@@ -13,7 +13,7 @@ class TestTranslationService:
     def service(self):
         """테스트용 서비스 인스턴스"""
         config = {
-            'model_name': 'qwen3:8b',
+            'model_name': 'gemma3n:e4b',
             'temperature': 0.1,
             'max_retries': 2,
             'ollama_url': 'http://localhost:11434',
@@ -70,7 +70,7 @@ This is document number {i+1} for batch translation testing.
             'sections_count': 3,
             'average_confidence': 0.85,
             'total_processing_time': 15.2,
-            'model_used': 'qwen3:8b',
+            'model_used': 'gemma3n:e4b',
             'low_quality_sections': []
         }
 
@@ -78,7 +78,7 @@ This is document number {i+1} for batch translation testing.
         """기본 설정으로 초기화 테스트"""
         service = TranslationService()
         
-        assert service.model_name == 'qwen3:8b'
+        assert service.model_name == 'gemma3n:e4b'
         assert service.temperature == 0.1
         assert service.max_retries == 3
         assert service.quality_threshold == 0.6

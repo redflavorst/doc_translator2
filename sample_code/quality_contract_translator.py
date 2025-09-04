@@ -976,7 +976,7 @@ class QualityContractTranslator:
 def main():
     """메인 실행 함수"""
     translator = QualityContractTranslator(
-        model_name="qwen3:8b",  # 최고 품질 모델
+        model_name="gemma3:4b",  # 최고 품질 모델
         temperature=0.1,           # 일관성 우선
         max_retries=3              # 품질 확보를 위한 재시도
     )

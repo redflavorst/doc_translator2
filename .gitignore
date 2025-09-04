@@ -21,10 +21,11 @@ pip-wheel-metadata/
 share/python-wheels/
 *.manifest
 *.spec
+nul
 
 # 가상환경
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -46,13 +47,22 @@ venv.bak/
 .DS_Store
 
 # 프로젝트 특정 디렉토리
-uploads/           # 업로드된 PDF 파일들
-outputs/           # 처리 결과 파일들
-temp_data/         # 임시 파일들
-workflow_states/   # 워크플로우 상태 파일들
-test_output*/      # 테스트 출력 디렉토리
-test_layout/       # 테스트 레이아웃 파일들
-logs/              # 로그 파일들
+# uploads/           # 업로드된 PDF 파일들
+# outputs/           # 처리 결과 파일들
+# temp_data/         # 임시 파일들
+# workflow_states/   # 워크플로우 상태 파일들
+# test_output*/      # 테스트 출력 디렉토리
+# test_layout/       # 테스트 레이아웃 파일들
+# logs/              # 로그 파일들
+# user_histories/
+uploads/           
+outputs/           
+temp_data/         
+workflow_states/   
+test_output*/      
+test_layout/       
+logs/              
+user_histories/
 
 # 샘플 데이터
 *.pdf              # 모든 PDF 파일

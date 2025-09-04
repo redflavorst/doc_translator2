@@ -31,6 +31,7 @@ from services.layout_analysis_service import LayoutAnalysisService, LayoutAnalys
 # 페이지별 레이아웃 분석 서비스 (테스트용)
 from services.layout_analysis_service_paged import LayoutAnalysisServicePaged
 from services.translation_service import TranslationService, BatchTranslationResult
+from services.pdf_converter_service import PDFConverterService
 from core.user_history_manager import UserHistoryManager
 
 # 로거 설정
@@ -72,6 +73,13 @@ translation_service = TranslationService({
     'ollama_url': app_config.translation.ollama_base_url,
     'quality_threshold': app_config.translation.quality_threshold,
     'max_retries': 3
+})
+
+# PDF 변환 서비스 인스턴스 생성
+pdf_converter_service = PDFConverterService({
+    'main_font': 'Malgun Gothic',  # Windows 한글 폰트
+    'geometry': 'margin=1.5cm',
+    'fontsize': '10pt'
 })
 
 # 업로드 디렉토리 설정
@@ -136,11 +144,13 @@ class DocumentProcessor:
     def __init__(self, workflow_manager: WorkflowManager, 
                  error_handler: WorkflowErrorHandler,
                  layout_service: LayoutAnalysisService,
-                 translation_service: TranslationService):
+                 translation_service: TranslationService,
+                 pdf_converter_service: PDFConverterService):
         self.workflow_manager = workflow_manager
         self.error_handler = error_handler
         self.layout_service = layout_service
         self.translation_service = translation_service
+        self.pdf_converter_service = pdf_converter_service
     
     async def process_document(self, file_path: str, output_dir: str) -> dict:
         """
@@ -190,6 +200,9 @@ class DocumentProcessor:
             
             # 2단계: 번역
             await self._execute_translation(workflow_id, state.output_directory)
+            
+            # 3단계: PDF 변환 및 병합
+            await self._execute_pdf_export(workflow_id, state.output_directory)
             
             # 완료 처리
             self.workflow_manager.complete_stage(workflow_id, WorkflowStage.COMPLETION)
@@ -287,8 +300,17 @@ class DocumentProcessor:
     
     async def _execute_translation(self, workflow_id: str, output_dir: str):
         """번역 실행"""
-        # 마크다운 파일들 찾기
-        markdown_files = list(Path(output_dir).glob("page_*.md"))
+        # 마크다운 파일들 찾기 - markdown 하위 폴더들에서 재귀적으로 검색
+        markdown_dir = Path(output_dir) / "markdown"
+        markdown_files = []
+        
+        if markdown_dir.exists():
+            # markdown/page_XXXX_0/page_XXXX.md 형식의 파일들 찾기
+            markdown_files = list(markdown_dir.glob("**/*.md"))
+        else:
+            # 기존 방식 폴백 (하위 호환성)
+            markdown_files = list(Path(output_dir).glob("page_*.md"))
+        
         # 이미 번역된 파일 제외
         markdown_files = [f for f in markdown_files if not str(f).endswith('_korean.md')]
         
@@ -324,7 +346,9 @@ class DocumentProcessor:
             
             # 개별 파일 번역
             try:
-                result = self.translation_service.translate_document(str(md_file))
+                # 출력 파일 경로를 원본과 같은 폴더에 설정
+                output_file = md_file.parent / f"{md_file.stem}_korean{md_file.suffix}"
+                result = self.translation_service.translate_document(str(md_file), str(output_file))
                 if result.success:
                     translated_files.append(result.output_file)
                     # 번역 성공 시 완료된 페이지 수 업데이트
@@ -364,9 +388,64 @@ class DocumentProcessor:
         }
 
 
+    async def _execute_pdf_export(self, workflow_id: str, output_dir: str):
+        """PDF 변환 및 병합 실행"""
+        try:
+            # 진행 상황 업데이트
+            self.workflow_manager.update_progress(
+                workflow_id,
+                current_action="번역된 마크다운 파일을 PDF로 변환 중...",
+                stage_details={"stage": "pdf_export", "status": "starting"}
+            )
+            
+            # PDF 변환 실행 (동기 함수를 비동기로 실행)
+            import asyncio
+            import concurrent.futures
+            
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                # 출력 PDF 파일 경로 설정
+                output_pdf_path = Path(output_dir) / "translated_document.pdf"
+                
+                result = await loop.run_in_executor(
+                    pool,
+                    self.pdf_converter_service.convert_to_pdf,
+                    str(output_dir),  # 마크다운 파일들이 있는 디렉토리
+                    str(output_pdf_path),  # 출력 PDF 경로
+                    True,  # include_metadata
+                    True,  # add_page_breaks
+                    None   # pdf_metadata
+                )
+            
+            if result.success:
+                self.workflow_manager.update_progress(
+                    workflow_id,
+                    current_action=f"PDF 변환 완료 ({result.total_pages}페이지)",
+                    stage_details={
+                        "stage": "pdf_export", 
+                        "status": "completed",
+                        "output_file": result.output_file,
+                        "total_pages": result.total_pages
+                    }
+                )
+                # 단계 완료 처리
+                self.workflow_manager.complete_stage(workflow_id, WorkflowStage.PDF_EXPORT)
+            else:
+                raise RuntimeError(f"PDF 변환 실패: {result.error}")
+                
+        except Exception as e:
+            # 에러 처리
+            self.workflow_manager.set_workflow_error(
+                workflow_id, 
+                type(e).__name__, 
+                str(e)
+            )
+            raise
+
+
 # 문서 처리기 인스턴스
 document_processor = DocumentProcessor(
-    workflow_manager, error_handler, layout_service, translation_service
+    workflow_manager, error_handler, layout_service, translation_service, pdf_converter_service
 )
 
 # ========== 인증 API 엔드포인트들 ==========

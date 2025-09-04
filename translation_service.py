@@ -30,9 +30,6 @@ class TranslationResult:
     processing_time: float
     error: Optional[str] = None
 
-# 구버전 API 호환성을 위한 alias
-BatchTranslationResult = TranslationResult
-
 class TranslationService:
     """개선된 번역 서비스"""
     
@@ -51,10 +48,6 @@ class TranslationService:
         
         # 병렬 처리
         self.executor = ThreadPoolExecutor(max_workers=4)
-        
-        # 번역 실패 텍스트 로그 파일
-        self.untranslated_log_path = Path(__file__).parent.parent / "untranslated_texts.txt"
-        self._untranslated_texts = set()  # 중복 방지용
         
         # Ollama 서버 확인
         self._check_ollama_server()
@@ -108,37 +101,17 @@ class TranslationService:
             with open(input_file, 'r', encoding='utf-8') as f:
                 content = f.read()
             
+            # 번역 실행
+            translated_content, report = self._translate_markdown_with_tables(session, content)
+            
             # 출력 파일 경로
             if not output_file:
                 input_path = Path(input_file)
                 output_file = str(input_path.parent / f"{input_path.stem}_korean{input_path.suffix}")
             
-            # 번역 실패 로그 파일 경로 설정
-            output_path = Path(output_file)
-            input_path = Path(input_file)
-            
-            # 경로에 따라 다르게 처리
-            if 'outputs' in str(output_path.parts):
-                # 웹에서 실행: outputs/user_id/markdown/page_xxxx_untranslated.txt
-                self.untranslated_log_path = output_path.parent / f"{output_path.stem}_untranslated.txt"
-            else:
-                # 직접 실행 (테스트): 출력 파일과 같은 위치
-                self.untranslated_log_path = output_path.parent / f"{input_path.stem}_untranslated.txt"
-            
-            self._untranslated_texts = set()  # 각 문서마다 초기화
-            
-            print(f"[INFO] Untranslated texts will be saved to: {self.untranslated_log_path}")
-            
-            # 번역 실행
-            translated_content, report = self._translate_markdown_with_tables(session, content)
-            
             # 파일 저장
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(translated_content)
-            
-            # 번역 실패 로그 요약
-            if self._untranslated_texts:
-                print(f"[INFO] {len(self._untranslated_texts)} untranslated texts logged")
             
             elapsed = time.time() - start_time
             
@@ -311,10 +284,10 @@ class TranslationService:
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = []
                 
-                # 짧은 텍스트 - 대량 배치 (100개씩)
+                # 짧은 텍스트 - 대량 배치 (50개씩)
                 if short_texts:
-                    for i in range(0, len(short_texts), 100):
-                        batch = short_texts[i:i+100]
+                    for i in range(0, len(short_texts), 50):
+                        batch = short_texts[i:i+50]
                         future = executor.submit(
                             self._batch_translate_json,
                             session,
@@ -366,64 +339,62 @@ class TranslationService:
         return result
     
     def _batch_translate_json(self, session: requests.Session, texts: List[str]) -> Dict[str, str]:
-        """개별 번역만 사용 (JSON 배치는 모델 문제로 비활성화)"""
+        """JSON 배치 번역 - 최적화"""
         if not texts:
             return {}
         
-        # gemma3n:e4b 모델이 JSON 배열을 제대로 처리하지 못하므로
-        # 개별 번역만 사용
-        print(f"[INFO] Translating {len(texts)} items individually...")
+        # 너무 많은 텍스트는 분할
+        MAX_BATCH = 30  # 한 번에 처리할 최대 개수
+        if len(texts) > MAX_BATCH:
+            result = {}
+            for i in range(0, len(texts), MAX_BATCH):
+                batch_result = self._batch_translate_json(session, texts[i:i+MAX_BATCH])
+                result.update(batch_result)
+            return result
+        
+        items = [{'id': str(i), 'text': text} for i, text in enumerate(texts)]
+        
+        # 더 간결한 프롬프트
+        prompt = f"""Translate each text to Korean. Return ONLY the JSON array without any thinking process or HTML tags.
+Example: [{{"id":"0","translated":"한글번역"}}]
+
+{json.dumps(items, ensure_ascii=False)}"""
+        
+        data = {
+            'model': self.model_name,
+            'prompt': prompt,
+            'stream': False,
+            'format': 'json',
+            'options': {
+                'temperature': 0.05,  # 더 낮은 온도
+                'num_predict': sum(len(t) for t in texts) * 3,  # 실제 필요한 크기
+                'num_ctx': min(16384, len(prompt) * 2),  # 컨텍스트 최적화
+                'top_p': 0.9
+            }
+        }
+        
+        try:
+            response = session.post(f'{self.ollama_url}/api/generate', json=data, timeout=120)
+            if response.status_code == 200:
+                result_text = response.json().get('response', '')
+                return self._parse_json_response(result_text, texts)
+        except Exception as e:
+            print(f"[ERROR] Batch translation failed: {e}")
+        
+        # 폴백: 개별 번역
         result = {}
-        for i, text in enumerate(texts):
-            translated = self._translate_single(session, text)
-            result[text] = translated
-            if (i + 1) % 10 == 0:
-                print(f"[PROGRESS] Translated {i+1}/{len(texts)} cells")
+        for text in texts:
+            result[text] = self._translate_single(session, text)
         return result
     
     def _translate_single(self, session: requests.Session, text: str) -> str:
         """단일 텍스트 번역"""
-        if not text or not text.strip():
-            return text
-        
-        # 번역 불필요한 케이스 체크
-        normalized = text.strip()
-        
-        # 1. 숫자만 있는 경우
-        if normalized.replace('.', '').replace(',', '').replace('-', '').replace('+', '').isdigit():
-            return text
-        
-        # 2. 특수문자만 있는 경우
-        if all(not c.isalnum() for c in normalized):
-            return text
-        
-        # 3. 숫자+단위 패턴 (예: 100%, $50, 2023년 등)
-        import re
-        if re.match(r'^[\d,.\-+]+\s*[%$€£¥₩년월일]?$', normalized):
-            return text
-        
-        # 4. 날짜 형식 (예: 2023-01-01, 01/01/2023)
-        if re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$', normalized):
-            return text
-        
-        # 5. 제품코드/ID 패턴 (숫자+영문 조합, 예: 64350675KR07, ABC123, MODEL-2024)
-        # 공백 없이 숫자와 영문이 섞여있으면 코드로 간주
-        if re.match(r'^[A-Z0-9\-_]+$', normalized, re.IGNORECASE):
-            # 최소 하나의 숫자와 하나의 문자가 있는 경우
-            has_digit = any(c.isdigit() for c in normalized)
-            has_alpha = any(c.isalpha() for c in normalized)
-            if has_digit and has_alpha:
-                return text
-        
-        # 6. 단일 영문 약어 (예: USA, KR, ID, CEO 등)
-        if re.match(r'^[A-Z]{2,}$', normalized):
-            return text
-            
-        # 프롬프트 개선 - thinking 방지
-        prompt = f"""Translate the following English text to Korean. Provide ONLY the Korean translation without any explanation.
+        prompt = f"""You are a professional translator. Translate the following text from English to Korean.
+IMPORTANT: Return ONLY the Korean translation. Do not include any thinking process, explanations, or HTML tags like <think>.
 
-English: {text}
-Korean:"""
+Text: {text}
+
+Korean translation:"""
         
         data = {
             'model': self.model_name,
@@ -431,9 +402,7 @@ Korean:"""
             'stream': False,
             'options': {
                 'temperature': 0.1,
-                'num_predict': min(8000, len(text) * 10),  # Further increased for complete responses
-                'top_p': 0.9,
-                'repeat_penalty': 1.1
+                'num_predict': min(2000, len(text) * 3)
             }
         }
         
@@ -441,107 +410,34 @@ Korean:"""
             response = session.post(f'{self.ollama_url}/api/generate', json=data, timeout=60)
             if response.status_code == 200:
                 result = response.json().get('response', '').strip()
-                
-                # Remove <think> tags completely - they contain thinking process
-                if '<think>' in result:
-                    # Find content after </think> tag
-                    if '</think>' in result:
-                        # Extract everything after the closing tag
-                        parts = result.split('</think>')
-                        if len(parts) > 1:
-                            # Get the last part (after all think tags)
-                            result = parts[-1].strip()
-                            # Clean any prompt echoes
-                            result = re.sub(r'^.*?Korean.*?:', '', result, flags=re.IGNORECASE).strip()
-                    else:
-                        # No closing tag - response was cut off
-                        # Try to extract Korean text that appears after common patterns
-                        patterns = [
-                            r'Korean.*?[:：]\s*([\uAC00-\uD7A3].*?)(?:$|\n|<)',
-                            r'translation.*?[:：]\s*([\uAC00-\uD7A3].*?)(?:$|\n|<)',
-                            r'([\uAC00-\uD7A3][\uAC00-\uD7A3\s\w.,!?;:()\-"\']+)'
-                        ]
-                        for pattern in patterns:
-                            match = re.search(pattern, result, re.IGNORECASE | re.DOTALL)
-                            if match:
-                                result = match.group(1) if '(' in pattern else match.group(0)
-                                result = result.strip()
-                                break
-                        else:
-                            # No Korean found - return original text as fallback
-                            print(f"[WARNING] No Korean found after <think> tag for: {text[:30]}...")
-                            return text
-                
-                # Clean up any remaining artifacts
-                result = result.strip()
-                if result.startswith(':'):
-                    result = result[1:].strip()
-                
-                # Validate that we got actual Korean translation
-                if result and result != text:
-                    # Check if result contains Korean characters
-                    has_korean = any('\uAC00' <= c <= '\uD7A3' for c in result)
-                    if has_korean:
-                        return result
-                    else:
-                        # 번역 실패 - 로그에 기록하고 원본 반환
-                        self._log_untranslated(text)
-                        print(f"[INFO] No Korean found, logged: {text[:30]}...")
-                        return text
-                else:
-                    # 번역 결과가 원본과 같음 - 로그에 기록하고 원본 반환
-                    self._log_untranslated(text)
-                    print(f"[INFO] Translation unchanged, logged: {text[:30]}...")
-                    return text
-        except Exception as e:
-            print(f"[ERROR] Translation API error: {e}")
-            self._log_untranslated(text)
+                # Remove thinking tags if present (both regular and HTML-encoded)
+                result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL)
+                result = re.sub(r'&lt;think&gt;.*?&lt;/think&gt;', '', result, flags=re.DOTALL)
+                # Also remove partial tags at the beginning/end
+                result = re.sub(r'^.*?</think>', '', result, flags=re.DOTALL)
+                result = re.sub(r'^.*?&lt;/think&gt;', '', result, flags=re.DOTALL)
+                result = re.sub(r'<think>.*?$', '', result, flags=re.DOTALL)
+                result = re.sub(r'&lt;think&gt;.*?$', '', result, flags=re.DOTALL)
+                return result.strip() or text
+        except:
+            pass
         
         return text
     
-    def _log_untranslated(self, text: str):
-        """번역 실패한 텍스트를 파일에 기록"""
-        if text not in self._untranslated_texts:
-            self._untranslated_texts.add(text)
-            try:
-                with open(self.untranslated_log_path, 'a', encoding='utf-8') as f:
-                    f.write(f"{text}\n")
-            except Exception as e:
-                print(f"[ERROR] Failed to log untranslated text: {e}")
-    
     def _translate_text(self, session: requests.Session, text: str) -> Tuple[str, float]:
-        """일반 텍스트 번역 - 마크다운 구조 보존"""
-        # 마크다운 헤더를 보존하기 위해 줄 단위로 처리
-        lines = text.split('\n')
-        translated_lines = []
+        """일반 텍스트 번역"""
+        if len(text) < 100:
+            return self._translate_single(session, text), 1.0
         
-        for line in lines:
-            # 빈 줄은 그대로 보존
-            if not line.strip():
-                translated_lines.append('')
-                continue
-                
-            # 마크다운 헤더는 별도 처리
-            header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
-            if header_match:
-                header_level = header_match.group(1)
-                header_text = header_match.group(2)
-                translated_header = self._translate_single(session, header_text)
-                translated_lines.append(f"{header_level} {translated_header}")
-            else:
-                # 일반 텍스트 줄
-                if len(line) < 100:
-                    translated_lines.append(self._translate_single(session, line))
-                else:
-                    # 긴 텍스트는 청크 분할
-                    chunks = self._split_into_chunks(line, 1000)
-                    translated_chunks = []
-                    for chunk in chunks:
-                        trans = self._translate_single(session, chunk)
-                        translated_chunks.append(trans)
-                    translated_lines.append(' '.join(translated_chunks))
+        # 청크 분할
+        chunks = self._split_into_chunks(text, 1000)
+        translated_chunks = []
         
-        return '\n'.join(translated_lines), 0.95
+        for chunk in chunks:
+            trans = self._translate_single(session, chunk)
+            translated_chunks.append(trans)
+        
+        return ' '.join(translated_chunks), 0.95
     
     def _split_into_chunks(self, text: str, chunk_size: int) -> List[str]:
         """텍스트를 청크로 분할"""
@@ -603,9 +499,9 @@ Korean:"""
 
 # 테스트
 if __name__ == "__main__":
-    base_dir = Path(__file__).resolve().parent.parent
-    input_md = base_dir / "uploads" / "page_0008.md"
-    output_md = base_dir / "uploads" / "page_0008_korean.md"
+    base_dir = Path(__file__).resolve().parent
+    input_md = base_dir / "uploads" / "page_0003.md"
+    output_md = base_dir / "uploads" / "page_0003_korean.md"
 
     service = TranslationService()
     result = service.translate_document(str(input_md), str(output_md))

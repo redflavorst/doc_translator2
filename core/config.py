@@ -28,7 +28,7 @@ class LayoutAnalysisConfig:
 class TranslationConfig:
     """번역 설정"""
     ollama_base_url: str = "http://localhost:11434"
-    model_name: str = "qwen3:8b"
+    model_name: str = "gemma3n:e4b"
     temperature: float = 0.1
     max_tokens: int = 2048
     quality_threshold: float = 0.6
@@ -69,7 +69,7 @@ class AppConfig:
             ),
             translation=TranslationConfig(
                 ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-                model_name=os.getenv("TRANSLATION_MODEL", "qwen3:8b"),
+                model_name=os.getenv("TRANSLATION_MODEL", "gemma3n:e4b"),
                 temperature=float(os.getenv("TRANSLATION_TEMPERATURE", "0.1")),
                 max_tokens=int(os.getenv("MAX_TOKENS", "2048")),
                 quality_threshold=float(os.getenv("QUALITY_THRESHOLD", "0.6"))

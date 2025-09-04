@@ -19,6 +19,7 @@ class WorkflowStage(Enum):
     """워크플로우 실행 단계"""
     LAYOUT_ANALYSIS = "LAYOUT_ANALYSIS"
     TRANSLATION = "TRANSLATION"
+    PDF_EXPORT = "PDF_EXPORT"
     COMPLETION = "COMPLETION"
 
 

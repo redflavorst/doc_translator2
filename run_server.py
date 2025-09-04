@@ -54,9 +54,8 @@ def check_dependencies():
     
     # 기존 서비스 파일들 확인
     required_files = [
-        "services/layout_analysis_service.py",
-        "services/translation_service.py",
-        "quality_contract_translator.py"
+        "services/layout_analysis_service_paged.py",
+        "services/translation_service.py"
     ]
     
     for file_path in required_files:

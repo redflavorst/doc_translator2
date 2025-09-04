@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(findstr:*)",
+      "Bash(pip install:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(nvcc:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.paddleocr.ai)",
+      "Bash(where cublas64_11.dll)",
+      "Bash(python:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(taskkill:*)",
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "Bash(diff:*)",
+      "Bash(dir servicestranslation_service.py)",
+      "Bash(dir services\\translation_service.py)",
+      "Bash(cp:*)"
+    ],
+    "deny": []
+  }
+}

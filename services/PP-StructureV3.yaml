@@ -1,0 +1,42 @@
+# ===== Root (필수) =====
+pipeline_name: layout_parsing.v2
+
+
+# ===== SubPipelines =====
+SubPipelines:
+  DocPreprocessor:                # ← 방향/언워핑(전처리) 서브파이프라인
+    pipeline_name: doc_preprocessor
+    use_doc_orientation_classify: true
+    use_doc_unwarping: false
+
+  GeneralOCR:
+    pipeline_name: OCR
+    # SubPipeline 단위로도 보조 옵션을 줄 수 있습니다.
+    use_doc_orientation_classify: true
+    use_textline_orientation: true
+    use_doc_unwarping: false
+
+    SubModules:
+      TextDetection:
+        module_name: text_detection
+        model_name: PP-OCRv5_server_det
+        thresh: 0.30
+        box_thresh: 0.60
+        unclip_ratio: 2.0
+
+      TextRecognition:
+        module_name: text_recognition
+        # 정확도 우선(느림): PP-OCRv5_server_rec
+        # 속도 우선(영어 전용, 가벼움): en_PP-OCRv4_mobile_rec
+        model_name: PP-OCRv5_server_rec
+        score_thresh: 0.65
+        batch_size: 32
+
+  # (선택) 테이블 구조 인식이 필요하면 아래 블록을 활성화하세요.
+  TableStructure:
+    pipeline_name: table_recognition.v2
+    SubModules:
+      TableStructure:
+        module_name: table_structure
+        model_name: EN_table_structure
+        score_thresh: 0.5

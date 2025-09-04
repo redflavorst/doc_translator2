@@ -22,7 +22,7 @@ class Config:
     
     # 번역 설정
     TRANSLATION_CONFIG = {
-        'model_name': os.getenv('OLLAMA_MODEL', 'qwen3:8b'),
+        'model_name': os.getenv('OLLAMA_MODEL', 'gemma3n:e4b'),
         'temperature': float(os.getenv('TEMPERATURE', '0.1')),
         'max_retries': int(os.getenv('MAX_RETRIES', '3')),
         'ollama_url': os.getenv('OLLAMA_URL', 'http://localhost:11434'),

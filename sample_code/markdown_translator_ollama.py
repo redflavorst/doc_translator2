@@ -9,7 +9,7 @@ def translate_your_documents():
     
     # 고품질 번역기 초기화
     translator = QualityContractTranslator(
-        model_name="qwen3:8b",  # 또는 "llama3.1:8b"
+        model_name="gemma3:4b",  # 또는 "llama3.1:8b"
         temperature=0.1,           # 낮은 온도로 일관성 확보
         max_retries=3              # 품질을 위한 재시도
     )
@@ -53,7 +53,7 @@ def translate_your_documents():
 def translate_all_in_folder(folder: str = './ppstruct_quick_output', pattern: str = 'page_[0-9][0-9][0-9][0-9].md'):
     """폴더 내 페이지별 마크다운을 일괄 번역"""
     translator = QualityContractTranslator(
-        model_name="qwen3:8b",
+        model_name="gemma3:4b",
         temperature=0.1,
         max_retries=3
     )

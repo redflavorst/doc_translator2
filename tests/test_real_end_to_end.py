@@ -38,7 +38,7 @@ class TestRealEndToEnd:
     def translation_service(self):
         """실제 번역 서비스 (빠른 설정)"""
         config = {
-            'model_name': 'qwen3:8b',  # 가장 작은 모델
+            'model_name': 'gemma3n:e4b',  # 가장 작은 모델
             'temperature': 0.1,
             'max_retries': 1,
             'quality_threshold': 0.3  # 테스트용 낮은 임계값
@@ -57,7 +57,7 @@ class TestRealEndToEnd:
             response = requests.get("http://localhost:11434/api/tags", timeout=5)
             models = [m['name'] for m in response.json().get('models', [])]
             
-            required_model = 'qwen3:8b'
+            required_model = 'gemma3n:e4b'
             if required_model not in models:
                 return False, f"모델 {required_model}이 설치되지 않았습니다. 설치 명령: ollama pull {required_model}"
             
@@ -255,7 +255,7 @@ if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as temp_dir:
         layout_service = LayoutAnalysisService({'use_gpu': False})
-        translation_service = TranslationService({'model_name': 'qqwen3:8b'})
+        translation_service = TranslationService({'model_name': 'qgemma3n:e4b'})
         
         try:
             result = test_instance.test_pdf_to_korean_pipeline(

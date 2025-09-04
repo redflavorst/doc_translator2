@@ -46,7 +46,7 @@ cp .env.example .env
 
 5. Ollama 모델 설치
 ```bash
-ollama pull qwen3:8b
+ollama pull gemma3n:e4b
 ```
 
 ## 🚀 실행
@@ -98,7 +98,7 @@ doc_translator/
 `.env` 파일에서 다음 설정을 조정할 수 있습니다:
 
 - `OLLAMA_BASE_URL`: Ollama 서버 주소 (기본: http://localhost:11434)
-- `TRANSLATION_MODEL`: 번역 모델 (기본: qwen3:8b)
+- `TRANSLATION_MODEL`: 번역 모델 (기본: gemma3n:e4b)
 - `API_PORT`: 웹 서버 포트 (기본: 8000)
 - `MAX_CONCURRENT_WORKFLOWS`: 동시 처리 가능한 워크플로우 수
 
