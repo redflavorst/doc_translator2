@@ -12,6 +12,7 @@ import threading
 import requests
 import re
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -47,10 +48,13 @@ class TranslationService:
         
         # 캐시
         self._cell_cache: Dict[str, str] = {}
+        self._cache_lock = threading.Lock()
         self._local = threading.local()
-        
+
         # 병렬 처리
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        default_workers = min(32, (os.cpu_count() or 1) * 5)
+        self.max_workers = int(self.config.get("max_workers", default_workers))
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         
         # 번역 실패 텍스트 로그 파일
         self.untranslated_log_path = Path(__file__).parent.parent / "untranslated_texts.txt"
@@ -289,10 +293,12 @@ class TranslationService:
         cache_hits = 0
         for norm_text, cell_ids in unique_texts.items():
             cache_key = self._cache_key(norm_text)
-            if cache_key in self._cell_cache:
+            with self._cache_lock:
+                cached = self._cell_cache.get(cache_key)
+            if cached is not None:
                 cache_hits += 1
                 for cell_id in cell_ids:
-                    result[cell_id] = self._cell_cache[cache_key]
+                    result[cell_id] = cached
             else:
                 to_translate.append((norm_text, cell_ids))
         
@@ -308,7 +314,7 @@ class TranslationService:
             medium_texts = [(t, ids) for t, ids in to_translate if 100 <= len(t) < 300]
             long_texts = [(t, ids) for t, ids in to_translate if len(t) >= 300]
             
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = []
                 
                 # 짧은 텍스트 - 대량 배치 (100개씩)
@@ -347,13 +353,15 @@ class TranslationService:
                                 if batch_type in ['short', 'medium']:
                                     translations = future.result()
                                     for (text, cell_ids), trans in zip(batch_data, translations.values()):
-                                        self._cell_cache[self._cache_key(text)] = trans
+                                        with self._cache_lock:
+                                            self._cell_cache[self._cache_key(text)] = trans
                                         for cell_id in cell_ids:
                                             result[cell_id] = trans
                                 else:  # long
                                     trans = future.result()
                                     text, cell_ids = batch_data[0]
-                                    self._cell_cache[self._cache_key(text)] = trans
+                                    with self._cache_lock:
+                                        self._cell_cache[self._cache_key(text)] = trans
                                     for cell_id in cell_ids:
                                         result[cell_id] = trans
                             except Exception as e:
@@ -533,12 +541,11 @@ Korean:"""
                 if len(line) < 100:
                     translated_lines.append(self._translate_single(session, line))
                 else:
-                    # 긴 텍스트는 청크 분할
+                    # 긴 텍스트는 청크 분할 후 병렬 처리
                     chunks = self._split_into_chunks(line, 1000)
-                    translated_chunks = []
-                    for chunk in chunks:
-                        trans = self._translate_single(session, chunk)
-                        translated_chunks.append(trans)
+                    futures = [self.executor.submit(self._translate_single, session, chunk)
+                               for chunk in chunks]
+                    translated_chunks = [f.result() for f in futures]
                     translated_lines.append(' '.join(translated_chunks))
         
         return '\n'.join(translated_lines), 0.95
