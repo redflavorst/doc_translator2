@@ -8,7 +8,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass
 import traceback
 import tempfile
@@ -102,10 +102,22 @@ class LayoutAnalysisServicePaged:
         self.config = config or {}
         self.logger = logging.getLogger(__name__)
         
-        # 기본 설정 (명시가 없으면 CUDA 빌드 시 자동 GPU 사용)
-        self.use_gpu = self.config.get('use_gpu', paddle.is_compiled_with_cuda())
+        # 기본 설정: 명시(use_gpu)가 없으면 CUDA 빌드 시 자동 GPU 사용
+        self.use_gpu = self.config['use_gpu'] if 'use_gpu' in self.config else paddle.is_compiled_with_cuda()
         self.use_table = self.config.get('use_table', True)
         self.enable_layout_detection = self.config.get('enable_layout_detection', True)  # 레이아웃 검출 활성화
+        # HPI/HPIP 가속 설정 (TensorRT/ONNX Runtime)
+        self.use_hpip = bool(self.config.get('use_hpip', False))
+        # tensorrt | onnxruntime
+        self.hpi_backend = str(self.config.get('hpi_backend', 'tensorrt')).lower()
+        # gpu | cpu (기본 gpu, 단 GPU 미가용 시 자동 CPU 폴백)
+        self.hpi_device = str(self.config.get('hpi_device', 'gpu')).lower()
+        # 이미지 래스터라이즈 DPI (PDF→이미지 해상도)
+        # 기본값 400, config로 전달 시 반영
+        try:
+            self.raster_dpi = int(self.config.get('raster_dpi', 400))
+        except Exception:
+            self.raster_dpi = 400
         
         # 스레드별 로컬 스토리지 (각 스레드마다 별도 모델 인스턴스)
         self._local = threading.local()
@@ -113,6 +125,11 @@ class LayoutAnalysisServicePaged:
         # 전역 모델 로드 카운터 (디버깅용)
         self._model_load_count = 0
         self._lock = threading.Lock()
+        # 최종 장치 정책 로그
+        try:
+            self._log(f"🎛️ use_gpu={self.use_gpu}, cuda_compiled={paddle.is_compiled_with_cuda()}")
+        except Exception:
+            pass
         
     def _log(self, message: str) -> None:
         """콘솔과 파일에 동시에 로그를 남김 (파일 경로가 설정된 경우)."""
@@ -279,11 +296,14 @@ class LayoutAnalysisServicePaged:
                 
                 start_load = time.time()
 
-                #cfg_path = (Path(__file__).parent / "PP-StructureV3.yaml").resolve()
+                cfg_path = (Path(__file__).parent / "PP-StructureV3.yaml").resolve()
                 device = 'gpu:0' if (self.use_gpu and paddle.is_compiled_with_cuda()) else 'cpu'
                 self._log_device_selection("PPStructureV3 init", device)
-               
-                # 스레드별 독립적인 모델 인스턴스 생성
+                
+                # HPIP 비활성화 (CUDA 12 미지원 회피)
+                self._log("🚫 HPIP 비활성화 모드: enable_hpi/use_tensorrt 미사용")
+
+                # 스레드별 독립적인 모델 인스턴스 생성 (커스텀 YAML 구성 사용)
                 # self._local.pipeline = PPStructureV3(
                 #     device=device,
                 #     #lang='en',
@@ -293,20 +313,25 @@ class LayoutAnalysisServicePaged:
                 #     use_textline_orientation=True,
                 #     paddlex_config=cfg
                 # )
-                self._local.pipeline = PPStructureV3(
-                    device=device,
-                    use_table_recognition=self.use_table,
-                    use_doc_unwarping=False,  # UVDoc 비활성화
-                    use_doc_orientation_classify=True,  # 방향 분류 비활성화
-                    use_textline_orientation=False,
-                    text_recognition_model_name='korean_PP-OCRv5_mobile_rec',
-                    #lang='en',
-                    #text_recognition_model_name='en_PP-OCRv4_mobile_rec',  # 영어 특화 경량 모델
-                    # 텍스트 검출 옵션 추가
-                    text_det_thresh=0.2,  # 텍스트 검출 임계값 (기본 0.3에서 낮춤)
-                    text_det_box_thresh=0.5,  # 박스 검출 임계값 (기본 0.6에서 낮춤)
-                    text_det_unclip_ratio=2.8  # 박스 확장 비율 (기본 2.0에서 증가)
-                )
+                # 디버그: 커스텀 YAML 사용 안내
+                self._log("🧩 PaddleX 커스텀 PP-StructureV3 YAML 구성 사용")
+
+                try:
+                    self._local.pipeline = PPStructureV3(
+                        device=device,
+                        use_table_recognition=self.use_table,
+                        use_doc_unwarping=False,
+                        use_doc_orientation_classify=False,
+                        use_textline_orientation=False,
+                        text_recognition_model_name='korean_PP-OCRv5_mobile_rec',
+                        text_det_thresh=0.2,
+                        text_det_box_thresh=0.5,
+                        text_det_unclip_ratio=2.8,
+                        paddlex_config=str(cfg_path)
+                    )
+                except Exception as e_primary:
+                    # pipeline_name 관련 오류라도 내장 구성 사용 중이면 재시도 불필요 → 즉시 전달
+                    raise
                 
                 load_time = time.time() - start_load
                 
@@ -326,7 +351,9 @@ class LayoutAnalysisServicePaged:
     
     
     def analyze_document(self, pdf_path: str, output_dir: str = None, 
-                        progress_callback=None) -> LayoutAnalysisResult:
+                        progress_callback=None,
+                        should_abort: Optional[Callable[[], bool]] = None,
+                        ocr_timeout_seconds: Optional[int] = None) -> LayoutAnalysisResult:
         """
         PDF 문서를 페이지별로 분석 (스레드 안전)
         
@@ -369,7 +396,14 @@ class LayoutAnalysisServicePaged:
             self._set_log_dir_from_output_dir(output_dir)
             
             # 페이지별 분할 처리
-            result = self._analyze_by_pages(pdf_path, output_dir, progress_callback, start_time)
+            result = self._analyze_by_pages(
+                pdf_path,
+                output_dir,
+                progress_callback,
+                start_time,
+                should_abort,
+                ocr_timeout_seconds
+            )
             
             # 분석 완료 후 리소스 정리
             self._cleanup_thread_resources()
@@ -394,7 +428,9 @@ class LayoutAnalysisServicePaged:
             )
     
     def _analyze_by_pages(self, pdf_path: Path, output_dir: Path, 
-                         progress_callback, start_time: float) -> LayoutAnalysisResult:
+                         progress_callback, start_time: float,
+                         should_abort: Optional[Callable[[], bool]] = None,
+                         ocr_timeout_seconds: Optional[int] = None) -> LayoutAnalysisResult:
         """페이지별로 분할하여 처리 (스레드별 독립 실행)"""
         
         thread_id = threading.current_thread().ident
@@ -407,6 +443,11 @@ class LayoutAnalysisServicePaged:
         doc = fitz.open(str(pdf_path))
         total_pages = len(doc)
         print(f"📑 스레드 {thread_id}: 총 페이지 수 - {total_pages}")
+
+        # 타임아웃 데드라인 계산
+        deadline = None
+        if isinstance(ocr_timeout_seconds, (int, float)) and ocr_timeout_seconds and ocr_timeout_seconds > 0:
+            deadline = start_time + ocr_timeout_seconds
         
         # PDF 메타데이터 추출
         pdf_metadata = self._extract_pdf_metadata(doc)
@@ -444,7 +485,23 @@ class LayoutAnalysisServicePaged:
         
         try:
             # 각 페이지를 개별 처리
+            aborted = False
+            timed_out = False
             for page_num in range(total_pages):
+                # 취소/타임아웃 사전 체크
+                if should_abort and callable(should_abort):
+                    try:
+                        if should_abort():
+                            aborted = True
+                            print(f"⛔ 스레드 {thread_id}: 취소 요청 감지. 분석 중단")
+                            break
+                    except Exception:
+                        # 취소 훅 예외는 무시하고 계속 진행
+                        pass
+                if deadline is not None and time.time() > deadline:
+                    timed_out = True
+                    print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃 초과. 분석 중단")
+                    break
                 try:
                     page_start = time.time()
                     current_page = page_num + 1
@@ -470,6 +527,20 @@ class LayoutAnalysisServicePaged:
                         progress_callback(page_num, total_pages, 
                                         f"페이지 {current_page}/{total_pages} 레이아웃 분석 중...")
                     
+                    # 취소/타임아웃 체크
+                    if should_abort and callable(should_abort):
+                        try:
+                            if should_abort():
+                                aborted = True
+                                print(f"⛔ 스레드 {thread_id}: 취소 요청 감지(레이아웃 분석 직전). 중단")
+                                break
+                        except Exception:
+                            pass
+                    if deadline is not None and time.time() > deadline:
+                        timed_out = True
+                        print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃(레이아웃 분석 직전). 중단")
+                        break
+
                     # 단일 페이지 분석 (스레드별 독립 모델 사용)
                     print(f"  🔍 스레드 {thread_id}: 레이아웃 분석 시작...")
                     
@@ -493,6 +564,20 @@ class LayoutAnalysisServicePaged:
                     
                     print(f"  ✅ 스레드 {thread_id}: 레이아웃 분석 완료")
                     
+                    # 취소/타임아웃 체크
+                    if should_abort and callable(should_abort):
+                        try:
+                            if should_abort():
+                                aborted = True
+                                print(f"⛔ 스레드 {thread_id}: 취소 요청 감지(시각화 직전). 중단")
+                                break
+                        except Exception:
+                            pass
+                    if deadline is not None and time.time() > deadline:
+                        timed_out = True
+                        print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃(시각화 직전). 중단")
+                        break
+
                     # LayoutDetection을 사용한 시각화
                     if self.enable_layout_detection:  # 모든 페이지에 대해 시각화 생성
                         layout_detector = self._get_layout_detector()
@@ -630,6 +715,28 @@ class LayoutAnalysisServicePaged:
             doc.close()
         
         total_time = time.time() - start_time
+
+        # 중단/타임아웃 결과 처리
+        if 'aborted' in locals() and aborted:
+            return LayoutAnalysisResult(
+                success=False,
+                pages=all_pages,
+                markdown_files=markdown_files,
+                confidence=0.0,
+                processing_time=total_time,
+                output_dir=str(output_dir),
+                error="Cancelled"
+            )
+        if 'timed_out' in locals() and timed_out:
+            return LayoutAnalysisResult(
+                success=False,
+                pages=all_pages,
+                markdown_files=markdown_files,
+                confidence=0.0,
+                processing_time=total_time,
+                output_dir=str(output_dir),
+                error="Timeout"
+            )
         print(f"\n✅ 스레드 {thread_id}: 전체 분석 완료!")
         print(f"   총 소요시간: {total_time:.2f}초")
         print(f"   페이지당 평균: {total_time/total_pages:.2f}초")

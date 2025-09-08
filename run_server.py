@@ -95,9 +95,13 @@ def main():
     try:
         import uvicorn
         # uvicorn 서버 실행
-        workers = int(os.getenv("UVICORN_WORKERS", os.getenv("WORKERS", "2")))
-        # 다중 워커 사용 시 --reload는 비활성화
-        reload_flag = workers == 1
+        import platform
+        # 윈도우에서는 워커 1개 권장 (프로세스 종료 지연/신호 처리 이슈 완화)
+        # 워커는 일단 고정 1 (윈도우 종료 지연/자원 중복 로드 방지)
+        workers = 1
+        # 다중 워커 사용 시 --reload는 비활성화 (윈도우 종료 지연 방지)
+        reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
+        shutdown_timeout = int(os.getenv("UVICORN_SHUTDOWN_TIMEOUT", "5"))
         uvicorn.run(
             "api.main:app",
             host="0.0.0.0",
@@ -105,7 +109,9 @@ def main():
             reload=reload_flag,
             log_level="info",
             reload_dirs=[str(project_root)] if reload_flag else None,
-            workers=workers
+            workers=workers,
+            timeout_graceful_shutdown=shutdown_timeout,
+            timeout_keep_alive=5
         )
     except KeyboardInterrupt:
         print("\n👋 서버를 종료합니다.")

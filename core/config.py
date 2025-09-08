@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import os
+try:
+    import paddle  # GPU 기본값 판단용 (선택)
+    _PADDLE_CUDA_COMPILED = bool(getattr(paddle, 'is_compiled_with_cuda', lambda: False)())
+except Exception:
+    _PADDLE_CUDA_COMPILED = False
 
 
 @dataclass
@@ -19,9 +24,13 @@ class WorkflowConfig:
 class LayoutAnalysisConfig:
     """레이아웃 분석 설정"""
     paddle_model_dir: Optional[str] = None
-    use_gpu: bool = False
+    use_gpu: bool = True
     batch_size: int = 1
     confidence_threshold: float = 0.5
+    # HPI/HPIP 관련 설정
+    use_hpip: bool = False
+    hpi_backend: str = "tensorrt"  # tensorrt | onnxruntime
+    hpi_device: str = "gpu"        # gpu | cpu
 
 
 @dataclass
@@ -63,9 +72,13 @@ class AppConfig:
             ),
             layout_analysis=LayoutAnalysisConfig(
                 paddle_model_dir=os.getenv("PADDLE_MODEL_DIR"),
-                use_gpu=os.getenv("USE_GPU", "false").lower() == "true",
+                # USE_GPU 명시 시 그 값을 사용, 미설정 시 CUDA 빌드면 기본 True
+                use_gpu=(os.getenv("USE_GPU").lower() == "true") if os.getenv("USE_GPU") is not None else _PADDLE_CUDA_COMPILED,
                 batch_size=int(os.getenv("BATCH_SIZE", "1")),
-                confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
+                confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.5")),
+                use_hpip=os.getenv("USE_HPIP", "false").lower() == "true",
+                hpi_backend=os.getenv("HPI_BACKEND", "tensorrt"),
+                hpi_device=os.getenv("HPI_DEVICE", "gpu")
             ),
             translation=TranslationConfig(
                 ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),

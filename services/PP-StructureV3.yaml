@@ -1,42 +1,221 @@
-# ===== Root (필수) =====
-pipeline_name: layout_parsing.v2
+pipeline_name: PP-StructureV3
 
+batch_size: 1
 
-# ===== SubPipelines =====
+use_doc_preprocessor: True
+use_seal_recognition: True
+use_table_recognition: True
+use_formula_recognition: True
+use_chart_recognition: False
+use_region_detection: True
+
+SubModules:
+  LayoutDetection:
+    module_name: layout_detection
+    model_name: PP-DocLayout_plus-L
+    model_dir: null
+    batch_size: 1
+    threshold:
+      0: 0.3
+      1: 0.5
+      2: 0.4
+      3: 0.5
+      4: 0.5
+      5: 0.5
+      6: 0.5
+      7: 0.3
+      8: 0.5
+      9: 0.5
+      10: 0.5
+      11: 0.5
+      12: 0.5
+      13: 0.5
+      14: 0.5
+      15: 0.45
+      16: 0.5
+      17: 0.5
+      18: 0.5
+      19: 0.5
+    layout_nms: True
+    layout_unclip_ratio: [1.0, 1.0]
+    layout_merge_bboxes_mode:
+      0: "large"
+      1: "large"
+      2: "union"
+      3: "union"
+      4: "union"
+      5: "union"
+      6: "union"
+      7: "large"
+      8: "union"
+      9: "union"
+      10: "union"
+      11: "union"
+      12: "union"
+      13: "union"
+      14: "union"
+      15: "union"
+      16: "large"
+      17: "union"
+      18: "union"
+      19: "union"
+
+  ChartRecognition:
+    module_name: chart_recognition
+    model_name: PP-Chart2Table
+    model_dir: null
+    batch_size: 1
+
+  RegionDetection:
+    module_name: layout_detection
+    model_name: PP-DocBlockLayout
+    model_dir: null
+    layout_nms: True
+    layout_merge_bboxes_mode: "small"
+
 SubPipelines:
-  DocPreprocessor:                # ← 방향/언워핑(전처리) 서브파이프라인
+  DocPreprocessor:
     pipeline_name: doc_preprocessor
-    use_doc_orientation_classify: true
-    use_doc_unwarping: falsex`
+    batch_size: 1
+    use_doc_orientation_classify: False
+    use_doc_unwarping: False
+    SubModules:
+      DocOrientationClassify:
+        module_name: doc_text_orientation
+        model_name: PP-LCNet_x1_0_doc_ori
+        model_dir: null
+        batch_size: 1
+      DocUnwarping:
+        module_name: image_unwarping
+        model_name: UVDoc
+        model_dir: null
 
   GeneralOCR:
     pipeline_name: OCR
-    # SubPipeline 단위로도 보조 옵션을 줄 수 있습니다.
-    use_doc_orientation_classify: true
-    use_textline_orientation: true
-    use_doc_unwarping: false
-
+    batch_size: 1
+    text_type: general
+    use_doc_preprocessor: False
+    use_textline_orientation: True
     SubModules:
       TextDetection:
         module_name: text_detection
         model_name: PP-OCRv5_server_det
-        thresh: 0.30
-        box_thresh: 0.60
-        unclip_ratio: 2.0
-
+        model_dir: null
+        limit_side_len: 736
+        limit_type: min
+        max_side_limit: 4000
+        thresh: 0.2
+        box_thresh: 0.5
+        unclip_ratio: 2.8
+      TextLineOrientation:
+        module_name: textline_orientation
+        model_name: PP-LCNet_x1_0_textline_ori
+        model_dir: null
+        batch_size: 1
       TextRecognition:
         module_name: text_recognition
-        # 정확도 우선(느림): PP-OCRv5_server_rec
-        # 속도 우선(영어 전용, 가벼움): en_PP-OCRv4_mobile_rec
-        model_name: PP-OCRv5_server_rec
+        model_name: korean_PP-OCRv5_mobile_rec
+        model_dir: null
+        batch_size: 1
         score_thresh: 0.65
-        batch_size: 32
 
-  # (선택) 테이블 구조 인식이 필요하면 아래 블록을 활성화하세요.
-  TableStructure:
-    pipeline_name: table_recognition.v2
+  TableRecognition:
+    pipeline_name: table_recognition_v2
+    use_layout_detection: False
+    use_doc_preprocessor: False
+    use_ocr_model: False
     SubModules:
-      TableStructure:
-        module_name: table_structure
-        model_name: EN_table_structure
-        score_thresh: 0.5
+      TableClassification:
+        module_name: table_classification
+        model_name: PP-LCNet_x1_0_table_cls
+        model_dir: null
+      WiredTableStructureRecognition:
+        module_name: table_structure_recognition
+        model_name: SLANeXt_wired
+        model_dir: null
+      WirelessTableStructureRecognition:
+        module_name: table_structure_recognition
+        model_name: SLANet_plus
+        model_dir: null
+      WiredTableCellsDetection:
+        module_name: table_cells_detection
+        model_name: RT-DETR-L_wired_table_cell_det
+        model_dir: null
+      WirelessTableCellsDetection:
+        module_name: table_cells_detection
+        model_name: RT-DETR-L_wireless_table_cell_det
+        model_dir: null
+      TableOrientationClassify:
+        module_name: doc_text_orientation
+        model_name: PP-LCNet_x1_0_doc_ori
+        model_dir: null
+    SubPipelines:
+      GeneralOCR:
+        pipeline_name: OCR
+        text_type: general
+        use_doc_preprocessor: False
+        use_textline_orientation: True
+        SubModules:
+          TextDetection:
+            module_name: text_detection
+            model_name: PP-OCRv5_server_det
+            model_dir: null
+            limit_side_len: 736
+            limit_type: min
+            max_side_limit: 4000
+            thresh: 0.3
+            box_thresh: 0.4
+            unclip_ratio: 1.5
+          TextLineOrientation:
+            module_name: textline_orientation
+            model_name: PP-LCNet_x1_0_textline_ori
+            model_dir: null
+            batch_size: 1
+          TextRecognition:
+            module_name: text_recognition
+            model_name: PP-OCRv5_server_rec
+            model_dir: null
+            batch_size: 1
+        score_thresh: 0.0
+
+  SealRecognition:
+    pipeline_name: seal_recognition
+    batch_size: 1
+    use_layout_detection: False
+    use_doc_preprocessor: False
+    SubPipelines:
+      SealOCR:
+        pipeline_name: OCR
+        batch_size: 1
+        text_type: seal
+        use_doc_preprocessor: False
+        use_textline_orientation: False
+        SubModules:
+          TextDetection:
+            module_name: seal_text_detection
+            model_name: PP-OCRv4_server_seal_det
+            model_dir: null
+            limit_side_len: 736
+            limit_type: min
+            max_side_limit: 4000
+            thresh: 0.2
+            box_thresh: 0.6
+            unclip_ratio: 0.5
+          TextRecognition:
+            module_name: text_recognition
+            model_name: PP-OCRv5_server_rec
+            model_dir: null
+            batch_size: 1
+            score_thresh: 0
+
+  FormulaRecognition:
+    pipeline_name: formula_recognition
+    batch_size: 1
+    use_layout_detection: False
+    use_doc_preprocessor: False
+    SubModules:
+      FormulaRecognition:
+        module_name: formula_recognition
+        model_name: PP-FormulaNet_plus-L
+        model_dir: null
+        batch_size: 1

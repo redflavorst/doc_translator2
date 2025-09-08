@@ -4,6 +4,7 @@ import shutil
 import zipfile
 from pathlib import Path
 from datetime import datetime
+import time
 from typing import Optional, List
 import tempfile
 import asyncio
@@ -84,8 +85,15 @@ upload_manager = UserUploadManager(db_manager)
 
 # 페이지별 처리 방식 사용 (실시간 진행률 추적 가능)
 layout_service = LayoutAnalysisServicePaged({
-    'use_gpu': app_config.layout_analysis.use_gpu,
-    'use_table': True
+    # 코드에서 GPU 및 HPIP를 강제 사용
+    'use_gpu': True,
+    'use_table': True,
+    # PDF→이미지 해상도 DPI 설정 (필요 시 환경변수나 core.config 연동 가능)
+    'raster_dpi': int(os.getenv('RASTER_DPI', '240')),
+    # HPI/HPIP 가속 설정 강제 (TensorRT 우선, 실패 시 ORT로 변경 가능)
+    'use_hpip': True,
+    'hpi_backend': 'tensorrt',  # 또는 'onnxruntime'
+    'hpi_device': 'gpu'
 })
 
 translation_service = TranslationService({
@@ -268,11 +276,31 @@ class DocumentProcessor:
         try:
             # 스레드 풀에서 동기 함수 실행
             import asyncio
+            start_time = time.time()
+            # 서버사이드 OCR 타임아웃(초). 환경변수 OCR_TIMEOUT_SECONDS로 조정 가능. 기본 900초
+            try:
+                ocr_timeout_seconds = int(os.getenv("OCR_TIMEOUT_SECONDS", "900"))
+            except Exception:
+                ocr_timeout_seconds = 900
+
+            # 취소/중단 체크 훅: 사용자가 취소했거나 상태가 RUNNING이 아니면 중단
+            def should_abort() -> bool:
+                try:
+                    state = self.workflow_manager.get_workflow(workflow_id)
+                    if state.status != WorkflowStatus.RUNNING:
+                        return True
+                except Exception:
+                    # 상태 조회 실패 시 안전하게 계속
+                    pass
+                return False
+
             result = await asyncio.to_thread(
                 self.layout_service.analyze_document,
                 input_file,
                 output_dir,
-                progress_callback
+                progress_callback,
+                should_abort,
+                ocr_timeout_seconds
             )
             
             if not result.success:
@@ -596,13 +624,27 @@ async def upload_document(
     output_dir.mkdir(exist_ok=True)
     
     try:
-        # 문서 처리: 큐에 등록(QUEUED), 스케줄러가 실행
+        # 문서 처리: 큐에 등록(QUEUED)
         workflow_id = workflow_manager.create_workflow(str(file_path), str(output_dir))
         result = {
             "workflow_id": workflow_id,
             "status": "queued",
             "message": "Document enqueued"
         }
+
+        # 멀티 워커 환경에서도 업로드한 워커가 즉시 실행 시도
+        async def _try_start_immediately(wid: str):
+            try:
+                state = workflow_manager.get_workflow(wid)
+                if state.status.value == "QUEUED":
+                    # 동시 실행 상한은 update_workflow_status 내부에서 검사됨
+                    workflow_manager.update_workflow_status(wid, WorkflowStatus.RUNNING)
+                    asyncio.create_task(document_processor._process_workflow(wid))
+            except Exception as e:
+                # 상한 초과/경합 등의 이유로 실패 시 스케줄러가 처리하도록 놔둔다
+                logger.warning(f"Immediate start skipped for {wid}: {e}")
+
+        asyncio.create_task(_try_start_immediately(workflow_id))
         
         # DB에 업로드 기록 추가
         try:
@@ -646,6 +688,23 @@ async def get_workflow_status(workflow_id: str):
             current_action=state.current_action,
             stage_details=state.stage_details
         )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+
+@app.post("/api/v1/workflows/{workflow_id}/cancel")
+async def cancel_workflow(workflow_id: str):
+    """
+    워크플로우 실행 취소 (즉시 중단 신호)
+    """
+    try:
+        state = workflow_manager.get_workflow(workflow_id)
+        # 이미 완료/실패인 경우 그대로 반환
+        if state.status in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED]:
+            return {"message": f"Workflow is already {state.status.value}"}
+        # 취소로 표시하면 레이아웃 분석 루프의 should_abort가 감지하여 중단됨
+        workflow_manager.set_workflow_error(workflow_id, "Cancelled", "Cancelled by user")
+        return {"message": "Workflow cancellation requested"}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -2684,5 +2743,6 @@ if __name__ == "__main__":
         "api.main:app",
         host=app_config.api_host,
         port=app_config.api_port,
-        reload=app_config.api_debug
+        reload=app_config.api_debug,
+        workers=1
     )
