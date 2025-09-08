@@ -9,6 +9,7 @@ import json
 class WorkflowStatus(Enum):
     """워크플로우 실행 상태"""
     CREATED = "CREATED"
+    QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"

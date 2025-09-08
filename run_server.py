@@ -95,13 +95,17 @@ def main():
     try:
         import uvicorn
         # uvicorn 서버 실행
+        workers = int(os.getenv("UVICORN_WORKERS", os.getenv("WORKERS", "2")))
+        # 다중 워커 사용 시 --reload는 비활성화
+        reload_flag = workers == 1
         uvicorn.run(
             "api.main:app",
             host="0.0.0.0",
             port=8000,
-            reload=True,  # 개발 모드
+            reload=reload_flag,
             log_level="info",
-            reload_dirs=[str(project_root)]  # 현재 디렉토리 감시
+            reload_dirs=[str(project_root)] if reload_flag else None,
+            workers=workers
         )
     except KeyboardInterrupt:
         print("\n👋 서버를 종료합니다.")

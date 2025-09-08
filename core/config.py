@@ -12,7 +12,7 @@ class WorkflowConfig:
     max_retry_count: int = 3
     retry_delay_seconds: int = 5
     auto_cleanup_days: int = 7
-    max_concurrent_workflows: int = 3
+    max_concurrent_workflows: int = 5
 
 
 @dataclass
@@ -59,7 +59,7 @@ class AppConfig:
                 max_retry_count=int(os.getenv("MAX_RETRY_COUNT", "3")),
                 retry_delay_seconds=int(os.getenv("RETRY_DELAY_SECONDS", "5")),
                 auto_cleanup_days=int(os.getenv("AUTO_CLEANUP_DAYS", "7")),
-                max_concurrent_workflows=int(os.getenv("MAX_CONCURRENT_WORKFLOWS", "3"))
+                max_concurrent_workflows=int(os.getenv("MAX_CONCURRENT_WORKFLOWS", "5"))
             ),
             layout_analysis=LayoutAnalysisConfig(
                 paddle_model_dir=os.getenv("PADDLE_MODEL_DIR"),

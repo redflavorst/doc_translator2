@@ -7,7 +7,7 @@ SubPipelines:
   DocPreprocessor:                # ← 방향/언워핑(전처리) 서브파이프라인
     pipeline_name: doc_preprocessor
     use_doc_orientation_classify: true
-    use_doc_unwarping: false
+    use_doc_unwarping: falsex`
 
   GeneralOCR:
     pipeline_name: OCR

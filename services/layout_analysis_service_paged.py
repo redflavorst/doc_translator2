@@ -102,8 +102,8 @@ class LayoutAnalysisServicePaged:
         self.config = config or {}
         self.logger = logging.getLogger(__name__)
         
-        # 기본 설정
-        self.use_gpu = self.config.get('use_gpu', False)
+        # 기본 설정 (명시가 없으면 CUDA 빌드 시 자동 GPU 사용)
+        self.use_gpu = self.config.get('use_gpu', paddle.is_compiled_with_cuda())
         self.use_table = self.config.get('use_table', True)
         self.enable_layout_detection = self.config.get('enable_layout_detection', True)  # 레이아웃 검출 활성화
         
@@ -113,6 +113,72 @@ class LayoutAnalysisServicePaged:
         # 전역 모델 로드 카운터 (디버깅용)
         self._model_load_count = 0
         self._lock = threading.Lock()
+        
+    def _log(self, message: str) -> None:
+        """콘솔과 파일에 동시에 로그를 남김 (파일 경로가 설정된 경우)."""
+        try:
+            print(message)
+            log_path = getattr(self._local, 'log_file_path', None)
+            if log_path:
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(message + "\n")
+        except Exception:
+            # 파일 로그 실패 시 콘솔만 유지
+            pass
+        
+    def _gpu_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        """현재 GPU 상태 스냅샷 수집 (메모리/부하). 실패 시 빈 딕셔너리."""
+        try:
+            import GPUtil  # 지연 임포트
+            snapshot: Dict[int, Dict[str, Any]] = {}
+            gpus = GPUtil.getGPUs()
+            for g in gpus:
+                snapshot[g.id] = {
+                    "name": g.name,
+                    "load_percent": round((g.load or 0) * 100, 1),
+                    "memory_used_mb": int(g.memoryUsed or 0),
+                    "memory_total_mb": int(g.memoryTotal or 0)
+                }
+            return snapshot
+        except Exception:
+            return {}
+
+    def _log_device_selection(self, label: str, device: str) -> None:
+        """장치 선택 및 GPU 상태를 로그로 출력"""
+        try:
+            cuda_compiled = paddle.is_compiled_with_cuda()
+            gpu_name = ""
+            if isinstance(device, str) and device.startswith('gpu') and cuda_compiled:
+                try:
+                    from paddle.device import cuda as paddle_cuda
+                    gpu_name = f" ({paddle_cuda.get_device_name(0)})"
+                except Exception:
+                    pass
+            self._log(f"🧭 {label}: device={device}, cuda_compiled={cuda_compiled}{gpu_name}")
+            snap = self._gpu_snapshot()
+            if snap:
+                for gid, info in snap.items():
+                    self._log(
+                        f"    GPU{gid} {info['name']} load={info['load_percent']}% "
+                        f"mem={info['memory_used_mb']}/{info['memory_total_mb']}MB"
+                    )
+        except Exception:
+            pass
+
+    def _set_log_dir_from_output_dir(self, output_dir: Path) -> None:
+        """출력 디렉토리 이름과 동일한 하위 폴더를 logs 아래에 만들고 파일 경로를 설정."""
+        try:
+            # output_dir 예: outputs/user_1_YYYYMMDD_... → logs/user_1_YYYYMMDD_...
+            logs_root = Path('./logs')
+            logs_root.mkdir(exist_ok=True)
+            per_run_log_dir = logs_root / output_dir.name
+            per_run_log_dir.mkdir(exist_ok=True)
+            self._local.log_file_path = str(per_run_log_dir / 'layout_gpu.log')
+            # 세션 시작 로그
+            self._log(f"🗂️ GPU 로그 파일: {self._local.log_file_path}")
+        except Exception:
+            # 파일 경로 설정 실패 시 무시 (콘솔 로그만)
+            pass
         
     def _get_layout_detector(self):
         """스레드별 LayoutDetection 모델 획득"""
@@ -124,9 +190,11 @@ class LayoutAnalysisServicePaged:
                 print(f"🎨 스레드 {thread_id}: LayoutDetection 모델 로드 중...")
                 
                 # PP-DocLayout_plus-L 모델 사용 (더 정확한 레이아웃 검출)
+                device = 'gpu:0' if (self.use_gpu and paddle.is_compiled_with_cuda()) else 'cpu'
+                self._log_device_selection("LayoutDetection init", device)
                 self._local.layout_detector = LayoutDetection(
                     model_name="PP-DocLayout_plus-L",
-                    device='cpu'  # GPU 사용 시 'gpu'로 변경
+                    device=device
                 )
                 
                 print(f"✅ 스레드 {thread_id}: LayoutDetection 모델 로드 완료!")
@@ -213,6 +281,7 @@ class LayoutAnalysisServicePaged:
 
                 #cfg_path = (Path(__file__).parent / "PP-StructureV3.yaml").resolve()
                 device = 'gpu:0' if (self.use_gpu and paddle.is_compiled_with_cuda()) else 'cpu'
+                self._log_device_selection("PPStructureV3 init", device)
                
                 # 스레드별 독립적인 모델 인스턴스 생성
                 # self._local.pipeline = PPStructureV3(
@@ -225,7 +294,7 @@ class LayoutAnalysisServicePaged:
                 #     paddlex_config=cfg
                 # )
                 self._local.pipeline = PPStructureV3(
-                    device='cpu',  # CPU 사용으로 안정성 확보
+                    device=device,
                     use_table_recognition=self.use_table,
                     use_doc_unwarping=False,  # UVDoc 비활성화
                     use_doc_orientation_classify=True,  # 방향 분류 비활성화
@@ -296,6 +365,8 @@ class LayoutAnalysisServicePaged:
                 output_dir = Path(output_dir).resolve()
             
             output_dir.mkdir(parents=True, exist_ok=True)
+            # 출력 디렉토리명과 동일한 logs 하위 폴더에 GPU 로그 저장
+            self._set_log_dir_from_output_dir(output_dir)
             
             # 페이지별 분할 처리
             result = self._analyze_by_pages(pdf_path, output_dir, progress_callback, start_time)
@@ -402,8 +473,23 @@ class LayoutAnalysisServicePaged:
                     # 단일 페이지 분석 (스레드별 독립 모델 사용)
                     print(f"  🔍 스레드 {thread_id}: 레이아웃 분석 시작...")
                     
-                    # PPStructureV3로 분석
+                    # PPStructureV3로 분석 (예측 전후 GPU 메모리 변화 로깅)
+                    before_snap = self._gpu_snapshot()
                     result = pipeline.predict(str(temp_img_path))
+                    after_snap = self._gpu_snapshot()
+                    if before_snap and after_snap:
+                        try:
+                            common_ids = set(before_snap.keys()) & set(after_snap.keys())
+                            for gid in sorted(common_ids):
+                                b = before_snap[gid]
+                                a = after_snap[gid]
+                                delta_mb = (a['memory_used_mb'] - b['memory_used_mb'])
+                                delta_load = round(a['load_percent'] - b['load_percent'], 1)
+                                print(
+                                    f"    📈 GPU{gid} mem Δ: {delta_mb}MB, load Δ: {delta_load}%"
+                                )
+                        except Exception:
+                            pass
                     
                     print(f"  ✅ 스레드 {thread_id}: 레이아웃 분석 완료")
                     

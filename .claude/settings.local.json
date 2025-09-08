@@ -17,7 +17,9 @@
       "Bash(diff:*)",
       "Bash(dir servicestranslation_service.py)",
       "Bash(dir services\\translation_service.py)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(dir:*)",
+      "Bash(pip index versions:*)"
     ],
     "deny": []
   }

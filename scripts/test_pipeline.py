@@ -16,7 +16,6 @@ sys.path.insert(0, str(project_root))
 import time
 import tempfile
 import shutil
-from services.layout_analysis_service import LayoutAnalysisService
 from services.translation_service import TranslationService
 
 def test_pipeline(pdf_path: str = None):

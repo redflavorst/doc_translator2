@@ -27,7 +27,6 @@ from core.auth_manager import AuthManager
 from core.user_upload_manager import UserUploadManager
 
 # 기존 서비스 파일들 import
-from services.layout_analysis_service import LayoutAnalysisService, LayoutAnalysisResult
 # 페이지별 레이아웃 분석 서비스 (테스트용)
 from services.layout_analysis_service_paged import LayoutAnalysisServicePaged
 from services.translation_service import TranslationService, BatchTranslationResult
@@ -43,6 +42,28 @@ app = FastAPI(
     description="PDF 문서를 한국어로 번역하는 서비스",
     version="1.0.0"
 )
+
+# 간단 스케줄러: 큐된 작업을 빈 슬롯에 투입
+@app.on_event("startup")
+async def start_scheduler():
+    async def scheduler_loop():
+        while True:
+            try:
+                running = workflow_manager.get_running_workflows_count()
+                capacity = app_config.workflow.max_concurrent_workflows
+                if running < capacity:
+                    # QUEUED 상태 조회
+                    queued = workflow_manager.list_workflows_by_status(WorkflowStatus.QUEUED)
+                    to_start = min(capacity - running, len(queued))
+                    for state in queued[:to_start]:
+                        # RUNNING으로 전환하고 처리 시작
+                        workflow_manager.update_workflow_status(state.id, WorkflowStatus.RUNNING)
+                        asyncio.create_task(document_processor._process_workflow(state.id))
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.warning(f"Scheduler loop error: {e}")
+                await asyncio.sleep(2.0)
+    asyncio.create_task(scheduler_loop())
 
 # 전역 서비스 인스턴스
 workflow_manager = WorkflowManager(app_config.workflow)
@@ -143,7 +164,7 @@ class DocumentProcessor:
     
     def __init__(self, workflow_manager: WorkflowManager, 
                  error_handler: WorkflowErrorHandler,
-                 layout_service: LayoutAnalysisService,
+                 layout_service: LayoutAnalysisServicePaged,
                  translation_service: TranslationService,
                  pdf_converter_service: PDFConverterService):
         self.workflow_manager = workflow_manager
@@ -163,24 +184,15 @@ class DocumentProcessor:
         Returns:
             처리 결과
         """
-        # 워크플로우 생성
+        # 기존 API 경로에서 직접 호출하던 생성/시작 로직은 업로드 엔드포인트로 이동
+        # 이 메서드는 외부에서 직접 사용하지 않도록 유지(호환성)
         workflow_id = self.workflow_manager.create_workflow(file_path, output_dir)
-        
-        try:
-            # 백그라운드에서 실제 처리 시작
-            asyncio.create_task(self._process_workflow(workflow_id))
-            
-            return {
-                "workflow_id": workflow_id,
-                "status": "processing",
-                "message": "Document processing started"
-            }
-            
-        except Exception as e:
-            self.workflow_manager.set_workflow_error(
-                workflow_id, type(e).__name__, str(e)
-            )
-            raise HTTPException(status_code=500, detail=str(e))
+        asyncio.create_task(self._process_workflow(workflow_id))
+        return {
+            "workflow_id": workflow_id,
+            "status": "queued",
+            "message": "Document enqueued"
+        }
     
     async def _process_workflow(self, workflow_id: str):
         """
@@ -255,15 +267,13 @@ class DocumentProcessor:
         
         try:
             # 스레드 풀에서 동기 함수 실행
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                result = await loop.run_in_executor(
-                    pool,
-                    self.layout_service.analyze_document,
-                    input_file,
-                    output_dir,
-                    progress_callback
-                )
+            import asyncio
+            result = await asyncio.to_thread(
+                self.layout_service.analyze_document,
+                input_file,
+                output_dir,
+                progress_callback
+            )
             
             if not result.success:
                 raise RuntimeError(f"Layout analysis failed: {result.error}")
@@ -328,6 +338,7 @@ class DocumentProcessor:
         translated_files = []
         failed_files = []
         
+        import asyncio
         for idx, md_file in enumerate(markdown_files, 1):
             # 진행 상황 업데이트 (페이지별 번역 진행)
             self.workflow_manager.update_progress(
@@ -348,7 +359,11 @@ class DocumentProcessor:
             try:
                 # 출력 파일 경로를 원본과 같은 폴더에 설정
                 output_file = md_file.parent / f"{md_file.stem}_korean{md_file.suffix}"
-                result = self.translation_service.translate_document(str(md_file), str(output_file))
+                result = await asyncio.to_thread(
+                    self.translation_service.translate_document,
+                    str(md_file),
+                    str(output_file)
+                )
                 if result.success:
                     translated_files.append(result.output_file)
                     # 번역 성공 시 완료된 페이지 수 업데이트
@@ -402,20 +417,17 @@ class DocumentProcessor:
             import asyncio
             import concurrent.futures
             
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                # 출력 PDF 파일 경로 설정
-                output_pdf_path = Path(output_dir) / "translated_document.pdf"
-                
-                result = await loop.run_in_executor(
-                    pool,
-                    self.pdf_converter_service.convert_to_pdf,
-                    str(output_dir),  # 마크다운 파일들이 있는 디렉토리
-                    str(output_pdf_path),  # 출력 PDF 경로
-                    True,  # include_metadata
-                    True,  # add_page_breaks
-                    None   # pdf_metadata
-                )
+            # 출력 PDF 파일 경로 설정
+            output_pdf_path = Path(output_dir) / "translated_document.pdf"
+            import asyncio
+            result = await asyncio.to_thread(
+                self.pdf_converter_service.convert_to_pdf,
+                str(output_dir),  # 마크다운 파일들이 있는 디렉토리
+                str(output_pdf_path),  # 출력 PDF 경로
+                True,  # include_metadata
+                True,  # add_page_breaks
+                None   # pdf_metadata
+            )
             
             if result.success:
                 self.workflow_manager.update_progress(
@@ -560,27 +572,37 @@ async def upload_document(
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
-    if file.size == 0:
-        raise HTTPException(status_code=400, detail="File is empty")
-    
-    # 파일 저장
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_filename = f"{timestamp}_{current_user.username}_{file.filename}"
+    # 혼잡 선제 체크 제거: 큐에 넣고 스케줄러가 실행
+
+    # 파일 저장 (파일명 충돌 방지: 마이크로초 + UUID)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique_tag = uuid.uuid4().hex[:8]
+    safe_filename = f"{timestamp}_{current_user.username}_{unique_tag}_{file.filename}"
     file_path = UPLOAD_DIR / safe_filename
     
     try:
+        # 동기 I/O를 스레드풀로 오프로드하여 이벤트 루프 블로킹 방지
+        from starlette.concurrency import run_in_threadpool
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            await run_in_threadpool(shutil.copyfileobj, file.file, buffer)
+        # 빈 파일 방지: 저장 후 파일 크기 검증
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            raise HTTPException(status_code=400, detail="File is empty")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
-    # 사용자별 출력 디렉토리 생성
-    output_dir = OUTPUT_DIR / f"user_{current_user.id}_{timestamp}"
+    # 사용자별 출력 디렉토리 생성 (경로 충돌 방지)
+    output_dir = OUTPUT_DIR / f"user_{current_user.id}_{timestamp}_{unique_tag}"
     output_dir.mkdir(exist_ok=True)
     
     try:
-        # 문서 처리 시작
-        result = await document_processor.process_document(str(file_path), str(output_dir))
+        # 문서 처리: 큐에 등록(QUEUED), 스케줄러가 실행
+        workflow_id = workflow_manager.create_workflow(str(file_path), str(output_dir))
+        result = {
+            "workflow_id": workflow_id,
+            "status": "queued",
+            "message": "Document enqueued"
+        }
         
         # DB에 업로드 기록 추가
         try:

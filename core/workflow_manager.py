@@ -42,16 +42,13 @@ class WorkflowManager:
         Raises:
             RuntimeError: 동시 실행 제한 초과 시
         """
-        # 동시 실행 제한 확인
-        self._check_concurrent_limit()
-        
         # 새 워크플로우 ID 생성
         workflow_id = str(uuid.uuid4())
         
         # 워크플로우 상태 생성
         state = WorkflowState(
             id=workflow_id,
-            status=WorkflowStatus.CREATED,
+            status=WorkflowStatus.QUEUED,
             current_stage=WorkflowStage.LAYOUT_ANALYSIS,
             stages_completed=[],
             input_file_path=input_file_path,
