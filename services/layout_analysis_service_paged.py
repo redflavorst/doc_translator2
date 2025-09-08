@@ -14,6 +14,8 @@ import traceback
 import tempfile
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
+import os
 import yaml
 
 try:
@@ -482,238 +484,69 @@ class LayoutAnalysisServicePaged:
         # 임시 디렉토리 생성 (스레드별로 독립)
         temp_dir = output_dir / f"temp_images_{thread_id}"
         temp_dir.mkdir(exist_ok=True)
-        
+
         try:
-            # 각 페이지를 개별 처리
-            aborted = False
-            timed_out = False
-            for page_num in range(total_pages):
-                # 취소/타임아웃 사전 체크
+            doc_lock = threading.Lock()
+
+            def process_page(page_num: int):
+                start = time.time()
+                current = page_num + 1
+                info = {"page_number": current, "thread_id": threading.current_thread().ident}
                 if should_abort and callable(should_abort):
                     try:
                         if should_abort():
-                            aborted = True
-                            print(f"⛔ 스레드 {thread_id}: 취소 요청 감지. 분석 중단")
-                            break
+                            info["error"] = "Cancelled"
+                            return {"page": info, "markdown_file": None, "aborted": True, "timed_out": False}
                     except Exception:
-                        # 취소 훅 예외는 무시하고 계속 진행
                         pass
-                if deadline is not None and time.time() > deadline:
-                    timed_out = True
-                    print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃 초과. 분석 중단")
-                    break
-                try:
-                    page_start = time.time()
-                    current_page = page_num + 1
-                    
-                    print(f"📄 스레드 {thread_id}: 페이지 {current_page}/{total_pages} 처리 시작")
-                    
-                    if progress_callback:
-                        progress_callback(page_num, total_pages, 
-                                        f"페이지 {current_page}/{total_pages} 추출 중...")
-                    
-                    # 페이지를 이미지로 추출 (고해상도)
+                if deadline and time.time() > deadline:
+                    info["error"] = "Timeout"
+                    return {"page": info, "markdown_file": None, "aborted": False, "timed_out": True}
+                if progress_callback:
+                    progress_callback(page_num, total_pages, f"페이지 {current}/{total_pages} 추출 중...")
+                with doc_lock:
                     page = doc[page_num]
-                    
-                    raster_dpi = getattr(self, "raster_dpi",400)
-                    zoom = raster_dpi /72.0
-                    matrix = fitz.Matrix(zoom, zoom)
+                    dpi = getattr(self, "raster_dpi", 400)
+                    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
                     pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=False)
-                    temp_img_path = temp_dir / f"page_{current_page:04d}.png"
-                    pix.save(str(temp_img_path))
-                    print(f"  🖼️ 스레드 {thread_id}: 이미지 추출 완료 - {temp_img_path.name}")
-                    
-                    if progress_callback:
-                        progress_callback(page_num, total_pages, 
-                                        f"페이지 {current_page}/{total_pages} 레이아웃 분석 중...")
-                    
-                    # 취소/타임아웃 체크
-                    if should_abort and callable(should_abort):
-                        try:
-                            if should_abort():
-                                aborted = True
-                                print(f"⛔ 스레드 {thread_id}: 취소 요청 감지(레이아웃 분석 직전). 중단")
-                                break
-                        except Exception:
-                            pass
-                    if deadline is not None and time.time() > deadline:
-                        timed_out = True
-                        print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃(레이아웃 분석 직전). 중단")
-                        break
+                img_path = temp_dir / f"page_{current:04d}.png"
+                pix.save(str(img_path))
+                if progress_callback:
+                    progress_callback(page_num, total_pages, f"페이지 {current}/{total_pages} 레이아웃 분석 중...")
+                result = pipeline.predict(str(img_path))
+                if progress_callback:
+                    progress_callback(page_num, total_pages, f"페이지 {current}/{total_pages} 마크다운 변환 중...")
+                md_path = self._process_page_result(result, current, output_dir)
+                md_file = str(md_path) if md_path else None
+                json_path = output_dir / f"page_{current:04d}_result.json"
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+                elapsed = time.time() - start
+                info.update({"markdown_file": md_file, "json_file": str(json_path), "processing_time": elapsed})
+                if progress_callback:
+                    progress_callback(current, total_pages, f"페이지 {current}/{total_pages} 완료")
+                return {"page": info, "markdown_file": md_file, "aborted": False, "timed_out": False}
 
-                    # 단일 페이지 분석 (스레드별 독립 모델 사용)
-                    print(f"  🔍 스레드 {thread_id}: 레이아웃 분석 시작...")
-                    
-                    # PPStructureV3로 분석 (예측 전후 GPU 메모리 변화 로깅)
-                    before_snap = self._gpu_snapshot()
-                    result = pipeline.predict(str(temp_img_path))
-                    after_snap = self._gpu_snapshot()
-                    if before_snap and after_snap:
-                        try:
-                            common_ids = set(before_snap.keys()) & set(after_snap.keys())
-                            for gid in sorted(common_ids):
-                                b = before_snap[gid]
-                                a = after_snap[gid]
-                                delta_mb = (a['memory_used_mb'] - b['memory_used_mb'])
-                                delta_load = round(a['load_percent'] - b['load_percent'], 1)
-                                print(
-                                    f"    📈 GPU{gid} mem Δ: {delta_mb}MB, load Δ: {delta_load}%"
-                                )
-                        except Exception:
-                            pass
-                    
-                    print(f"  ✅ 스레드 {thread_id}: 레이아웃 분석 완료")
-                    
-                    # 취소/타임아웃 체크
-                    if should_abort and callable(should_abort):
-                        try:
-                            if should_abort():
-                                aborted = True
-                                print(f"⛔ 스레드 {thread_id}: 취소 요청 감지(시각화 직전). 중단")
-                                break
-                        except Exception:
-                            pass
-                    if deadline is not None and time.time() > deadline:
-                        timed_out = True
-                        print(f"⏱️ 스레드 {thread_id}: OCR 타임아웃(시각화 직전). 중단")
-                        break
-
-                    # LayoutDetection을 사용한 시각화
-                    if self.enable_layout_detection:  # 모든 페이지에 대해 시각화 생성
-                        layout_detector = self._get_layout_detector()
-                        if layout_detector:
-                            try:
-                                print(f"  🎨 스레드 {thread_id}: 레이아웃 검출 및 시각화 시작...")
-                                
-                                # LayoutDetection 실행
-                                layout_output = layout_detector.predict(
-                                    str(temp_img_path), 
-                                    batch_size=1, 
-                                    layout_nms=True  # Non-Maximum Suppression 적용
-                                )
-                                
-                                # 시각화 저장
-                                viz_dir = output_dir / "layout_visualizations"
-                                viz_dir.mkdir(exist_ok=True)
-                                
-                                for idx, res in enumerate(layout_output):
-                                    # 결과 출력
-                                    print(f"    📊 레이아웃 검출 결과 {idx+1}:")
-                                    res.print()
-                                    
-                                    # 시각화 이미지 저장
-                                    res.save_to_img(save_path=str(viz_dir) + "/")
-                                    
-                                    # JSON 결과 저장
-                                    json_path = viz_dir / f"page_{current_page:04d}_layout.json"
-                                    res.save_to_json(save_path=str(json_path))
-                                    
-                                    print(f"    💾 시각화 저장 완료: {viz_dir}")
-                                    
-                            except Exception as e:
-                                self.logger.warning(f"레이아웃 검출 실패: {e}")
-                    
-                    if progress_callback:
-                        progress_callback(page_num, total_pages, 
-                                        f"페이지 {current_page}/{total_pages} 마크다운 변환 중...")
-                    
-                    # 결과 처리 - PaddleOCR 공식 API 사용
-                    markdown_dir = output_dir / "markdown"
-                    json_dir = output_dir / "json"
-                    vis_dir = output_dir / "visualizations"
-                    markdown_dir.mkdir(exist_ok=True)
-                    json_dir.mkdir(exist_ok=True)
-                    vis_dir.mkdir(exist_ok=True)
-                    
-                    # PPStructureV3가 predict 시 이미 시각화를 저장했으므로 추가 처리 불필요
-                    # vis_dir에 이미 시각화된 이미지가 저장됨
-                    print(f"  📸 시각화 이미지 저장 완료: {vis_dir}")
-                    
-                    # 공식 API를 사용한 결과 저장 시도
-                    saved_md = False
-                    saved_json = False
-                    
-                    md_path = None
-                    json_path = None
-                    
-                    if isinstance(result, list):
-                        for idx, res in enumerate(result):
-                            if hasattr(res, 'save_to_markdown'):
-                                try:
-                                    res.save_to_markdown(save_path=str(markdown_dir) + f"/page_{current_page:04d}_{idx}")
-                                    saved_md = True
-                                except:
-                                    pass
-                            if hasattr(res, 'save_to_json'):
-                                try:
-                                    res.save_to_json(save_path=str(json_dir) + f"/page_{current_page:04d}_{idx}")
-                                    saved_json = True
-                                except:
-                                    pass
-                    
-                    # 공식 API 실패시 기존 방식 사용
-                    if not saved_md:
-                        md_path = self._process_page_result(result, current_page, output_dir)
-                        if md_path:
-                            markdown_files.append(str(md_path))
-                            print(f"  📝 스레드 {thread_id}: 마크다운 저장 - {md_path.name}")
-                    else:
-                        md_path = markdown_dir / f"page_{current_page:04d}_0.md"
-                        if md_path.exists():
-                            markdown_files.append(str(md_path))
-                            print(f"  📝 스레드 {thread_id}: 마크다운 저장 (공식 API) - {md_path.name}")
-                    
-                    # 페이지별 JSON 결과 저장 (공식 API 실패시)
-                    if not saved_json:
-                        json_path = output_dir / f"page_{current_page:04d}_result.json"
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(result, f, ensure_ascii=False, indent=2, default=str)
-                    
-                    if saved_md:
-                        # 기존: md_path = markdown_dir / f"page_{current_page:04d}_0.md"
-                        candidates = sorted(markdown_dir.glob(f"page_{current_page:04d}_*.md"))
-                        if candidates:
-                            md_path = candidates[0]
-                            markdown_files.append(str(md_path))
-                            print(f"  📝 스레드 {thread_id}: 마크다운 저장 (공식 API) - {md_path.name}")
-
-                    if saved_json and json_path is None:
-                        # json_dir 안에 이 페이지 번호로 저장된 첫 파일을 대표로 잡기
-                        candidates = sorted(json_dir.glob(f"page_{current_page:04d}_*.json"))
-                        if candidates:
-                            json_path = candidates[0]
-                    
-                    page_time = time.time() - page_start
-                    
-                    all_pages.append({
-                        "page_number": current_page,
-                        "markdown_file": str(md_path) if md_path else None,
-                        "json_file": str(json_path) if json_path else None,
-                        "processing_time": page_time,
-                        "thread_id": thread_id
-                    })
-                    
-                    print(f"  ⏱️ 스레드 {thread_id}: 페이지 처리 완료 (소요시간: {page_time:.2f}초)")
-                    
-                    if progress_callback:
-                        progress_callback(current_page, total_pages, 
-                                        f"페이지 {current_page}/{total_pages} 완료")
-                    
-                except Exception as e:
-                    print(f"  ❌ 스레드 {thread_id}: 페이지 {current_page} 처리 실패: {e}")
-                    self.logger.warning(f"스레드 {thread_id}: 페이지 {current_page} 처리 실패: {e}")
-                    all_pages.append({
-                        "page_number": current_page,
-                        "error": str(e),
-                        "thread_id": thread_id
-                    })
-            
-            # 임시 디렉토리 정리
+            aborted = False
+            timed_out = False
+            max_workers = min(self.config.get('page_workers', os.cpu_count() or 4), total_pages)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(process_page, i) for i in range(total_pages)]
+                results = [f.result() for f in futures]
+            for res in results:
+                all_pages.append(res["page"])
+                if res.get("markdown_file"):
+                    markdown_files.append(res["markdown_file"])
+                if res.get("aborted"):
+                    aborted = True
+                if res.get("timed_out"):
+                    timed_out = True
+            all_pages.sort(key=lambda x: x["page_number"])
+            markdown_files = [p["markdown_file"] for p in all_pages if p.get("markdown_file")]
             shutil.rmtree(temp_dir, ignore_errors=True)
-            
         finally:
             doc.close()
-        
+
         total_time = time.time() - start_time
 
         # 중단/타임아웃 결과 처리
