@@ -601,6 +601,92 @@ Korean:"""
             result[cell['id']] = trans
         return result
 
+    # ==================== JSON 기반 번역 (DeepSeek-OCR용) ====================
+
+    def translate_layout_json(self, layout_json: Dict, output_path: Optional[str] = None) -> Dict:
+        """
+        레이아웃 JSON 번역 (DeepSeek-OCR 결과용)
+
+        Args:
+            layout_json: 레이아웃 JSON (components 포함)
+            output_path: 번역된 JSON 저장 경로 (optional)
+
+        Returns:
+            Dict: 번역된 레이아웃 JSON
+        """
+        start_time = time.time()
+        session = self._get_session()
+
+        print(f"\n📝 JSON 기반 번역 시작")
+
+        try:
+            # 원본 JSON 복사
+            translated_json = json.loads(json.dumps(layout_json))
+
+            # 컴포넌트 번역
+            components = translated_json.get('components', [])
+            total_components = len(components)
+            translated_count = 0
+
+            for idx, comp in enumerate(components):
+                comp_type = comp.get('type', 'text')
+                original_text = comp.get('text', '')
+
+                # 텍스트가 없으면 스킵
+                if not original_text:
+                    continue
+
+                print(f"   [{idx+1}/{total_components}] 번역 중... (타입: {comp_type})")
+
+                # 테이블 처리
+                if comp_type == 'table':
+                    cells = comp.get('cells', [])
+                    for cell in cells:
+                        cell_text = cell.get('text', '')
+                        if cell_text:
+                            translated_cell = self._translate_single(session, cell_text)
+                            cell['original_text'] = cell_text
+                            cell['translated_text'] = translated_cell
+                            translated_count += 1
+                else:
+                    # 일반 텍스트 번역
+                    translated_text = self._translate_single(session, original_text)
+                    comp['original_text'] = original_text
+                    comp['translated_text'] = translated_text
+                    translated_count += 1
+
+            elapsed = time.time() - start_time
+
+            # 메타데이터 추가
+            if 'metadata' not in translated_json:
+                translated_json['metadata'] = {}
+
+            translated_json['metadata']['translation'] = {
+                'timestamp': time.time(),
+                'model': self.model_name,
+                'total_components': total_components,
+                'translated_count': translated_count,
+                'processing_time': elapsed
+            }
+
+            # 파일 저장
+            if output_path:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(translated_json, f, ensure_ascii=False, indent=2)
+                print(f"   💾 번역된 JSON 저장: {output_path}")
+
+            print(f"✅ JSON 번역 완료!")
+            print(f"   번역된 컴포넌트: {translated_count}/{total_components}")
+            print(f"   소요 시간: {elapsed:.2f}초")
+
+            return translated_json
+
+        except Exception as e:
+            self.logger.error(f"JSON 번역 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return layout_json
+
 # 테스트
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent.parent
